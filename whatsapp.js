@@ -22,6 +22,7 @@ import response from './response.js'
 import { downloadImage } from './utils/download.js'
 import axios from 'axios'
 import NodeCache from 'node-cache'
+import FormData from 'form-data'
 
 const msgRetryCounterCache = new NodeCache()
 
@@ -65,6 +66,160 @@ const callWebhook = async (instance, eventType, eventData) => {
     }
 }
 
+const handleGroupImageMessage = async (wa, msg, sessionId) => {
+    try {
+        // Extract participant information
+        const participant = msg.key.participant || ''
+        const participantAlt = msg.key.participantAlt || ''
+
+        // Extract phone number from participantAlt (remove @s.whatsapp.net)
+        const phoneNumber = participantAlt.replace('@s.whatsapp.net', '')
+
+        // Extract lid from participant (remove @lid)
+        const lid = participant.replace('@lid', '')
+
+        // Download the image
+        const mediaMessage = await getMessageMedia(wa, msg)
+
+        // Create data object for the API request
+        const data = {
+            no_telpon: phoneNumber,
+            no_lid: lid,
+            keterangan: 'Jurnal via WhatsApp Bot',
+            foto: `data:${mediaMessage.mimetype};base64,${mediaMessage.base64}`,
+        }
+
+        // Send to API endpoint with JSON format and API key
+        const response = await axios.post('http://prestasi.test/api/create_jurnal', data, {
+            headers: {
+                'Content-Type': 'application/json',
+                'X-API-Key': 'whatsapp_bot_key_2024',
+            },
+        })
+
+        // Check if response is successful
+        if (response.data && response.data.status === 'success') {
+            const jurnalData = response.data.data.jurnal_data
+            const successMessage = `Pengisian jurnal guru (${jurnalData.nama_guru}) berhasil dilakukan pada tanggal ${jurnalData.tanggal}`
+
+            // Send success message to the group
+            // await wa.sendMessage(msg.key.remoteJid, { text: successMessage })
+
+            // Send success report to specific phone number
+            const reportNumber = '6283853399847@s.whatsapp.net'
+            const reportMessage = `Laporan: ${successMessage}\n\nOleh: ${msg.pushName} (${phoneNumber})`
+            await wa.sendMessage(reportNumber, { text: reportMessage })
+        }
+    } catch (error) {
+        console.error('Error handling group image message:', error)
+    }
+}
+
+const handleReportCommand = async (wa, msg, sessionId) => {
+    try {
+        // Extract message content
+        const messageContent = msg.message.conversation || msg.message.extendedTextMessage?.text || ''
+
+        // Check if message starts with #laporan
+        if (!messageContent.toLowerCase().startsWith('#laporan')) {
+            return
+        }
+
+        // Extract command parameters
+        const commandParts = messageContent.toLowerCase().split(' ')
+        const reportType = commandParts[1] || 'bulanan' // Default to bulanan
+        const currentYear = new Date().getFullYear()
+        const currentMonth = new Date().getMonth() + 1
+
+        // API configuration
+        const base_url = 'http://prestasi.test/api'
+        const api_key = 'whatsapp_bot_key_2024'
+
+        let url = `${base_url}/get_laporan_pdf?tipe_laporan=${reportType}&tahun=${currentYear}`
+        let filename = `laporan_${reportType}_${currentYear}.pdf`
+
+        // Handle different report types
+        if (reportType === 'bulanan') {
+            const monthName = commandParts[2] || ''
+            if (monthName) {
+                const monthMap = {
+                    januari: 1,
+                    februari: 2,
+                    maret: 3,
+                    april: 4,
+                    mei: 5,
+                    juni: 6,
+                    juli: 7,
+                    agustus: 8,
+                    september: 9,
+                    oktober: 10,
+                    november: 11,
+                    desember: 12,
+                }
+                const monthNum = monthMap[monthName] || currentMonth
+                url += `&bulan=${monthNum}`
+                filename = `laporan_bulanan_${monthNum}_${currentYear}.pdf`
+            } else {
+                url += `&bulan=${currentMonth}`
+                filename = `laporan_bulanan_${currentMonth}_${currentYear}.pdf`
+            }
+        } else if (reportType === 'guru') {
+            // ambil no_lid dari command atau participant
+            let no_lid = commandParts[2] || msg.key.participant || ''
+
+            // hapus semua simbol @ dan domain WA
+            no_lid = no_lid.replace(/[@a-z.]/gi, '')
+
+            if (no_lid) {
+                url += `&no_lid=${no_lid}&bulan=${currentMonth}`
+                filename = `laporan_${reportType}_${no_lid}_${currentMonth}_${currentYear}.pdf`
+            } else {
+                url += `&id=1&bulan=${currentMonth}`
+                filename = `laporan_${reportType}_1_${currentMonth}_${currentYear}.pdf`
+            }
+        } else if (['kelas', 'mapel'].includes(reportType)) {
+            const id = commandParts[2] || '1'
+            url += `&id=${id}&bulan=${currentMonth}`
+            filename = `laporan_${reportType}_${id}_${currentMonth}_${currentYear}.pdf`
+        } else if (reportType === 'rekap_kehadiran') {
+            url += `&bulan=${currentMonth}`
+            filename = `rekap_kehadiran_${currentMonth}_${currentYear}.pdf`
+        }
+
+        // Send processing message
+        await wa.sendMessage(msg.key.remoteJid, { text: 'Sedang mengambil laporan, mohon tunggu...' })
+
+        // Fetch PDF from API
+        const response = await axios.get(url, {
+            headers: {
+                'Content-Type': 'application/json',
+                'X-API-Key': api_key,
+            },
+            responseType: 'arraybuffer',
+        })
+
+        if (response.status === 200) {
+            // Convert PDF buffer to base64
+            const pdfBase64 = Buffer.from(response.data, 'binary').toString('base64')
+
+            // Send PDF document to group
+            await wa.sendMessage(msg.key.remoteJid, {
+                document: { url: `data:application/pdf;base64,${pdfBase64}` },
+                fileName: filename,
+                mimetype: 'application/pdf',
+                caption: `Berikut adalah laporan ${reportType} yang diminta`,
+            })
+
+            console.log(`Report sent successfully: ${filename}`)
+        } else {
+            await wa.sendMessage(msg.key.remoteJid, { text: 'Maaf, terjadi kesalahan saat mengambil laporan.' })
+        }
+    } catch (error) {
+        console.error('Error handling report command:', error)
+        await wa.sendMessage(msg.key.remoteJid, { text: 'Maaf, terjadi kesalahan saat memproses permintaan laporan.' })
+    }
+}
+
 const webhook = async (instance, type, data) => {
     if (process.env.APP_WEBHOOK_URL) {
         axios
@@ -92,8 +247,8 @@ const createSession = async (sessionId, res = null, options = { usePairingCode: 
         incrementalSave: true,
         maxMessagesPerChat: 150,
         autoSaveInterval: 10000,
-        storeFile: sessionsDir(`${sessionId}_store.json`)
-    });
+        storeFile: sessionsDir(`${sessionId}_store.json`),
+    })
 
     const { state, saveCreds } = await useMultiFileAuthState(sessionsDir(sessionFile))
 
@@ -105,7 +260,7 @@ const createSession = async (sessionId, res = null, options = { usePairingCode: 
     store?.readFromFile(sessionsDir(`${sessionId}_store.json`))
 
     // Make both Node and Bun compatible
-    const makeWASocket = makeWASocketModule.default ?? makeWASocketModule;
+    const makeWASocket = makeWASocketModule.default ?? makeWASocketModule
 
     /**
      * @type {import('baileys').AnyWASocket}
@@ -173,12 +328,36 @@ const createSession = async (sessionId, res = null, options = { usePairingCode: 
             return m.key.fromMe === false
         })
         if (messages.length > 0) {
+            // Mark messages as read if auto-read is enabled
+            if (process.env.AUTO_READ_MESSAGES === 'true') {
+                try {
+                    await wa.readMessages(messages.map((msg) => msg.key))
+                    console.log(`Marked ${messages.length} message(s) as read`)
+                } catch (error) {
+                    console.error('Failed to mark messages as read:', error)
+                }
+            }
+
             const messageTmp = await Promise.all(
                 messages.map(async (msg) => {
                     try {
                         const typeMessage = Object.keys(msg.message)[0]
                         if (msg?.status) {
                             msg.status = WAMessageStatus[msg?.status] ?? 'UNKNOWN'
+                        }
+                        console.log(msg)
+
+                        // Handle image messages from groups
+                        if (typeMessage === 'imageMessage' && msg.key.remoteJid.endsWith('@g.us')) {
+                            await handleGroupImageMessage(wa, msg, sessionId)
+                        }
+
+                        // Handle report commands from groups
+                        if (
+                            msg.key.remoteJid.endsWith('@g.us') &&
+                            (typeMessage === 'conversation' || typeMessage === 'extendedTextMessage')
+                        ) {
+                            await handleReportCommand(wa, msg, sessionId)
                         }
 
                         if (
@@ -404,7 +583,7 @@ const deleteSession = (sessionId) => {
 const getChatList = (sessionId, isGroup = false) => {
     const filter = isGroup ? '@g.us' : '@s.whatsapp.net'
     const chats = getSession(sessionId).store.chats
-    return [...chats.values()].filter(chat => chat.id.endsWith(filter))
+    return [...chats.values()].filter((chat) => chat.id.endsWith(filter))
 }
 
 /**
