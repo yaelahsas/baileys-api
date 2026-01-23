@@ -1,0 +1,13 @@
+version: '3.8'
+
+services:
+  baileys:
+    build: .
+    container_name: baileys-api
+    ports:
+      - "9999:9999"
+    volumes:
+      - ./sessions:/app/sessions
+    restart: unless-stopped
+    env_file:
+      - .env
