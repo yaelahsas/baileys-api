@@ -65,32 +65,228 @@ const callWebhook = async (instance, eventType, eventData) => {
         await webhook(instance, eventType, eventData)
     }
 }
+const handleGroupCommands = async (wa, msg, sessionId) => {
+    try {
+        const messageContent = msg.message.conversation || msg.message.extendedTextMessage?.text || ''
 
-const handleGroupImageMessage = async (wa, msg, sessionId) => {
+        // Kalau pesan kosong atau bukan teks, skip
+        if (!messageContent) return false
+
+        const text = messageContent.trim().toLowerCase()
+
+        // Ambil kata pertama sebagai command
+        const command = text.split(' ')[0]
+
+        // ===== LIST COMMAND YANG DIKENALI =====
+        const knownCommands = ['#laporan', '#jurnal']
+
+        // Kalau bukan command yang kita kenal, abaikan saja
+        if (!knownCommands.includes(command)) {
+            return false
+        }
+
+        // ===== GLOBAL AUTHORIZATION CHECK =====
+        const sender = msg.key.participantAlt || msg.key.remoteJid
+        const phoneNumber = sender.replace(/[@s.whatsapp.net@g.us]/g, '')
+
+        const authorizedNumbers = ['6285212870484', '6283853399847'] // Ganti dengan nomor yang diizinkan
+        const isAuthorized = authorizedNumbers.includes(phoneNumber)
+
+        if (!isAuthorized) {
+            await wa.sendMessage(msg.key.remoteJid, {
+                text: 'Anda tidak dapat menggunakan fitur ini.',
+            })
+
+            return true
+        }
+
+        switch (command) {
+            case '#laporan': {
+                // ===== PANGGIL FUNGSI LAMA TANPA DIUBAH =====
+                await handleReportCommand(wa, msg, sessionId)
+
+                return true
+            }
+
+            case '#jurnal': {
+                // ===== FITUR BARU: JURNAL VIA QUOTED IMAGE =====
+                const parts = text.split(' ')
+                let tanggalInput = null
+
+                // cek apakah user kirim tanggal
+                if (parts.length > 1) {
+                    tanggalInput = parts[1]
+                }
+
+                // validasi format tanggal jika ada
+                let tanggalFinal = null
+
+                if (tanggalInput) {
+                    const regex = /^(\d{2})-(\d{2})-(\d{4})$/
+
+                    if (!regex.test(tanggalInput)) {
+                        await wa.sendMessage(msg.key.remoteJid, {
+                            text: 'Format tanggal salah. Gunakan format: #jurnal DD-MM-YYYY\nContoh: #jurnal 03-02-2026',
+                        })
+                        return true
+                    }
+
+                    // convert ke format YYYY-MM-DD untuk API
+                    const [dd, mm, yyyy] = tanggalInput.split('-')
+                    tanggalFinal = `${yyyy}-${mm}-${dd}`
+                }
+
+                // Cek apakah pesan ini mereply sesuatu
+                const quoted = msg.message?.extendedTextMessage?.contextInfo?.quotedMessage
+                const contextInfo = msg
+                console.log('Quoted message:', contextInfo)
+
+                if (!quoted) {
+                    await wa.sendMessage(msg.key.remoteJid, {
+                        text: 'Harap reply sebuah gambar untuk menggunakan perintah #jurnal',
+                    })
+                    return true
+                }
+
+                // Pastikan yang direply adalah gambar
+                if (!quoted.imageMessage) {
+                    await wa.sendMessage(msg.key.remoteJid, {
+                        text: 'Pesan yang direply bukan gambar. Mohon reply pesan gambar.',
+                    })
+                    return true
+                }
+
+                // Bangun ulang format message agar kompatibel dengan fungsi lama
+                // const fakeMsg = {
+                //     key: msg.message.extendedTextMessage.contextInfo,
+                //     message: {
+                //         imageMessage: quoted.imageMessage,
+                //     },
+                //     pushName: msg.pushName,
+                // }
+
+                console.log('Processing jurnal from quoted image...')
+
+                // Pakai fungsi jurnal lama tanpa perubahan
+                await handleGroupImageMessage(wa, msg, sessionId, tanggalFinal)
+
+                return true
+            }
+
+            default:
+                // Bukan command yang kita kenal
+                return false
+        }
+    } catch (error) {
+        console.error('Error in handleGroupCommands:', error)
+
+        await wa.sendMessage(msg.key.remoteJid, {
+            text: 'Terjadi kesalahan saat memproses perintah.',
+        })
+
+        return true
+    }
+}
+
+const handleGroupImageMessage = async (wa, msg, sessionId, tanggalCustom = null) => {
     try {
         // Extract participant information
         const participant = msg.key.participant || ''
         const participantAlt = msg.key.participantAlt || ''
 
-        // Extract phone number from participantAlt (remove @s.whatsapp.net)
-        const phoneNumber = participantAlt.replace('@s.whatsapp.net', '')
+        let phoneNumber = ''
+        let lid = ''
+        let quoted = false
 
-        // Extract lid from participant (remove @lid)
-        const lid = participant.replace('@lid', '')
+        // ===== MODE QUOTED MESSAGE =====
+        if (msg.message?.extendedTextMessage?.contextInfo?.participant) {
+            const quotedParticipant = msg.message.extendedTextMessage.contextInfo.participant
+            quoted = true
+            console.log('Using quoted participant as sender:', quotedParticipant)
 
-        // Download the image
-        const mediaMessage = await getMessageMedia(wa, msg)
+            lid = quotedParticipant.replace('@lid', '')
+        }
+        // ===== MODE NORMAL (TANPA QUOTE) =====
+        else {
+            const participant = msg.key.participant || ''
+            const participantAlt = msg.key.participantAlt || ''
 
+            if (participantAlt) {
+                phoneNumber = participantAlt.replace('@s.whatsapp.net', '')
+            } else if (participant) {
+                phoneNumber = participant.replace('@s.whatsapp.net', '')
+            } else if (msg.key.remoteJid) {
+                phoneNumber = msg.key.remoteJid.replace('@s.whatsapp.net', '')
+            }
+
+            if (participant) {
+                lid = participant.replace('@lid', '')
+            } else if (msg.key.remoteJid) {
+                lid = msg.key.remoteJid.replace('@lid', '')
+            }
+        }
+
+        console.log('Final sender used for jurnal:', {
+            phoneNumber,
+            lid,
+        })
+
+        let mediaMessage
+
+        // Kalau message ini datang dari quoted
+        if (msg.message?.extendedTextMessage?.contextInfo?.quotedMessage) {
+            const quoted = msg.message.extendedTextMessage.contextInfo.quotedMessage
+
+            console.log('Processing media from quoted message')
+
+            const buffer = await downloadMediaMessage(
+                {
+                    key: msg.key,
+                    message: quoted,
+                },
+                'buffer',
+                {},
+                { reuploadRequest: wa.updateMediaMessage },
+            )
+
+            const imageData = quoted.imageMessage
+
+            mediaMessage = {
+                messageType: 'imageMessage',
+                fileName: '',
+                caption: imageData.caption || '',
+                size: {
+                    fileLength: imageData.fileLength,
+                    height: imageData.height,
+                    width: imageData.width,
+                },
+                mimetype: imageData.mimetype,
+                base64: buffer.toString('base64'),
+            }
+        } else {
+            // Mode normal (gambar langsung)
+            mediaMessage = await getMessageMedia(wa, msg)
+        }
+
+        // tentukan tanggal
+        let tanggalKirim = tanggalCustom
+
+        if (!tanggalKirim) {
+            const today = new Date()
+            tanggalKirim = today.toISOString().split('T')[0] // YYYY-MM-DD
+        }
         // Create data object for the API request
         const data = {
-            no_telpon: phoneNumber,
             no_lid: lid,
             keterangan: 'Jurnal via WhatsApp Bot',
             foto: `data:${mediaMessage.mimetype};base64,${mediaMessage.base64}`,
+            tanggal: tanggalKirim,
         }
 
+        console.log('Sending jurnal data to API:', { no_telpon: phoneNumber, no_lid: lid })
+
         // Send to API endpoint with JSON format and API key
-        const response = await axios.post('http://prestasi.test/api/create_jurnal', data, {
+        const response = await axios.post('http://10.46.1.16:9998/api/create_jurnal', data, {
             headers: {
                 'Content-Type': 'application/json',
                 'X-API-Key': 'whatsapp_bot_key_2024',
@@ -100,10 +296,11 @@ const handleGroupImageMessage = async (wa, msg, sessionId) => {
         // Check if response is successful
         if (response.data && response.data.status === 'success') {
             const jurnalData = response.data.data.jurnal_data
-            const successMessage = `Pengisian jurnal guru (${jurnalData.nama_guru}) berhasil dilakukan pada tanggal ${jurnalData.tanggal}`
+            const successMessage = `Pengisian jurnal atas nama ${jurnalData.nama_guru} berhasil dilakukan pada tanggal ${jurnalData.tanggal}`
 
             // Send success message to the group
             // await wa.sendMessage(msg.key.remoteJid, { text: successMessage })
+            await wa.sendMessage(msg.key.remoteJid, { text: successMessage }, { quoted: msg })
 
             // Send success report to specific phone number
             const reportNumber = '6283853399847@s.whatsapp.net'
@@ -132,7 +329,7 @@ const handleReportCommand = async (wa, msg, sessionId) => {
         const currentMonth = new Date().getMonth() + 1
 
         // API configuration
-        const base_url = 'http://prestasi.test/api'
+        const base_url = 'http://10.46.1.16:9998/api'
         const api_key = 'whatsapp_bot_key_2024'
 
         let url = `${base_url}/get_laporan_pdf?tipe_laporan=${reportType}&tahun=${currentYear}`
@@ -187,7 +384,6 @@ const handleReportCommand = async (wa, msg, sessionId) => {
         }
 
         // Send processing message
-        await wa.sendMessage(msg.key.remoteJid, { text: 'Sedang mengambil laporan, mohon tunggu...' })
 
         // Fetch PDF from API
         const response = await axios.get(url, {
@@ -203,20 +399,24 @@ const handleReportCommand = async (wa, msg, sessionId) => {
             const pdfBase64 = Buffer.from(response.data, 'binary').toString('base64')
 
             // Send PDF document to group
-            await wa.sendMessage(msg.key.remoteJid, {
-                document: { url: `data:application/pdf;base64,${pdfBase64}` },
-                fileName: filename,
-                mimetype: 'application/pdf',
-                caption: `Berikut adalah laporan ${reportType} yang diminta`,
-            })
+            await wa.sendMessage(
+                msg.key.remoteJid,
+                {
+                    document: { url: `data:application/pdf;base64,${pdfBase64}` },
+                    fileName: filename,
+                    mimetype: 'application/pdf',
+                    caption: `Berikut adalah laporan ${reportType} yang diminta`,
+                },
+                { quoted: msg },
+            )
 
             console.log(`Report sent successfully: ${filename}`)
         } else {
-            await wa.sendMessage(msg.key.remoteJid, { text: 'Maaf, terjadi kesalahan saat mengambil laporan.' })
+            await wa.sendMessage(msg.key.remoteJid, { text: 'Maaf, terjadi kesalahan saat mengambil laporan.' }, { quoted: msg })
         }
     } catch (error) {
         console.error('Error handling report command:', error)
-        await wa.sendMessage(msg.key.remoteJid, { text: 'Maaf, terjadi kesalahan saat memproses permintaan laporan.' })
+        await wa.sendMessage(msg.key.remoteJid, { text: 'Maaf, terjadi kesalahan saat memproses permintaan laporan.' }, { quoted: msg })
     }
 }
 
@@ -341,11 +541,11 @@ const createSession = async (sessionId, res = null, options = { usePairingCode: 
             const messageTmp = await Promise.all(
                 messages.map(async (msg) => {
                     try {
+                        console.log('Processing incoming message:', msg)
                         const typeMessage = Object.keys(msg.message)[0]
                         if (msg?.status) {
                             msg.status = WAMessageStatus[msg?.status] ?? 'UNKNOWN'
                         }
-                        console.log(msg)
 
                         // Handle image messages from groups
                         if (typeMessage === 'imageMessage' && msg.key.remoteJid.endsWith('@g.us')) {
@@ -357,7 +557,12 @@ const createSession = async (sessionId, res = null, options = { usePairingCode: 
                             msg.key.remoteJid.endsWith('@g.us') &&
                             (typeMessage === 'conversation' || typeMessage === 'extendedTextMessage')
                         ) {
-                            await handleReportCommand(wa, msg, sessionId)
+                            const handled = await handleGroupCommands(wa, msg, sessionId)
+
+                            // Kalau sudah diproses sebagai command, stop di sini
+                            if (handled) {
+                                return
+                            }
                         }
 
                         if (
