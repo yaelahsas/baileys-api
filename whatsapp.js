@@ -397,7 +397,7 @@ Contoh yang benar:
 
         console.log('[INFO] Mengirim data ke API...')
 
-        const response = await axios.post('http://prestasi.test/api/create_jurnal', data, {
+        const response = await axios.post('http://10.46.1.16:9998/api/create_jurnal', data, {
             headers: {
                 'Content-Type': 'application/json',
                 'X-API-Key': 'whatsapp_bot_key_2024',
@@ -447,7 +447,7 @@ const handleReportCommand = async (wa, msg, sessionId) => {
         const commandParts = messageContent.toLowerCase().split(' ')
 
         // API config
-        const base_url = 'http://prestasi.test/api'
+        const base_url = 'http://10.46.1.16:9998/api'
         const api_key = 'whatsapp_bot_key_2024'
 
         const currentYear = new Date().getFullYear()
