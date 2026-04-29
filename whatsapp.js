@@ -382,17 +382,120 @@ const init = () => {
 
     sessionManager.init(
         (m) => {
-            // Message upsert handler will be set per session
+            // Message upsert handler - will be processed per session
+            // This is a placeholder that will be overridden by per-session handlers
         },
         (update) => {
-            // Connection update handler will be set per session
+            // Connection update handler - will be processed per session
+            // This is a placeholder that will be overridden by per-session handlers
         },
         (instance, type, data) => {
             callWebhook(instance, type, data)
         }
     )
 
-    success('WhatsApp', 'WhatsApp bot initialized successfully')
+    // After sessions are restored, we need to set up proper handlers for each session
+    setTimeout(() => {
+        const sessionIds = sessionManager.getListSessions()
+        info('WhatsApp', 'Setting up handlers for restored sessions', {
+            sessionCount: sessionIds.length,
+        })
+
+        sessionIds.forEach(sessionId => {
+            const wa = sessionManager.getSession(sessionId)
+            if (wa) {
+                // Remove existing messages.upsert listeners and add proper handler
+                wa.ev.removeAllListeners('messages.upsert')
+                wa.ev.on('messages.upsert', (m) => handleMessageUpsert(m, sessionId, wa, wa.store))
+
+                // Remove existing connection.update listeners and add proper handler
+                wa.ev.removeAllListeners('connection.update')
+                wa.ev.on('connection.update', (update) => handleConnectionUpdate(update, sessionId, wa, wa.store))
+
+                // Setup additional event listeners
+                setupEventListeners(wa, sessionId, (instance, type, data) => callWebhook(instance, type, data))
+
+                // Setup messages.update handler
+                wa.ev.on('messages.update', async (m) => {
+                    debug('WhatsApp', 'messages.update event received', {
+                        sessionId,
+                        updateCount: m.length,
+                    })
+
+                    for (const { key, update } of m) {
+                        const getMessage = (key) => {
+                            if (wa.store) {
+                                const msg = wa.store.loadMessages(key.remoteJid, key.id)
+                                return msg?.message || undefined
+                            }
+                            return proto.Message.fromObject({})
+                        }
+
+                        const msg = await getMessage(key)
+
+                        if (!msg) {
+                            debug('WhatsApp', 'Message not found in store', {
+                                sessionId,
+                                messageId: key.id,
+                            })
+                            continue
+                        }
+
+                        update.status = WAMessageStatus[update.status]
+                        const messagesUpdate = [
+                            {
+                                key,
+                                update,
+                                message: msg,
+                            },
+                        ]
+                        callWebhook(sessionId, 'MESSAGES_UPDATE', messagesUpdate)
+                    }
+                })
+
+                // Setup message-receipt.update handler
+                wa.ev.on('message-receipt.update', async (m) => {
+                    debug('WhatsApp', 'message-receipt.update event received', {
+                        sessionId,
+                        receiptCount: m.length,
+                    })
+
+                    const getMessage = (key) => {
+                        if (wa.store) {
+                            const msg = wa.store.loadMessages(key.remoteJid, key.id)
+                            return msg?.message || undefined
+                        }
+                        return proto.Message.fromObject({})
+                    }
+
+                    for (const { key, messageTimestamp, pushName, broadcast, update } of m) {
+                        if (update?.pollUpdates) {
+                            const pollCreation = await getMessage(key)
+                            if (pollCreation) {
+                                const pollMessage = await getAggregateVotesInPollMessage({
+                                    message: pollCreation,
+                                    pollUpdates: update.pollUpdates,
+                                })
+                                update.pollUpdates[0].vote = pollMessage
+                                callWebhook(sessionId, 'MESSAGES_RECEIPT_UPDATE', [
+                                    { key, messageTimestamp, pushName, broadcast, update },
+                                ])
+                                return
+                            }
+                        }
+                    }
+
+                    callWebhook(sessionId, 'MESSAGES_RECEIPT_UPDATE', m)
+                })
+
+                success('WhatsApp', 'Handlers set up for restored session', {
+                    sessionId,
+                })
+            }
+        })
+
+        success('WhatsApp', 'WhatsApp bot initialized successfully')
+    }, 1000) // Wait 1 second for sessions to be fully restored
 }
 
 // Export all functions for backward compatibility and external use

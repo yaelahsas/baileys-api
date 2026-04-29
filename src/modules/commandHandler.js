@@ -482,11 +482,11 @@ const handleGroupImageMessage = async (wa, msg, sessionId, tanggalCustom = null)
         try {
             if (msg.message?.extendedTextMessage?.contextInfo?.participant) {
                 const quotedParticipant = msg.message.extendedTextMessage.contextInfo.participant
-                lid = quotedParticipant.replace(/[@s.whatsapp.net]/g, '')
+                lid = quotedParticipant.replace(/@.*$/, '')
                 console.log('[INFO] Mode QUOTE - LID dari quoted:', lid)
             } else {
                 const participant = msg.key.participant || msg.key.remoteJid
-                lid = participant.replace(/[@s.whatsapp.net]/g, '')
+                lid =  participant.replace(/@.*$/, '')
                 console.log('[INFO] Mode NORMAL - LID dari pengirim:', lid)
             }
 

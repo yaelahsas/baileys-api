@@ -258,9 +258,16 @@ const filterMessages = (messages) => {
             return false
         }
 
-        incoming('MessageHandler', 'Message accepted for processing', {
+        // Log incoming message with more details
+        const messageType = Object.keys(msg.message || {})[0] || 'unknown'
+        const isGroup = msg.key.remoteJid?.endsWith('@g.us')
+        
+        incoming('MessageHandler', `New ${isGroup ? 'group' : 'private'} message received`, {
             messageId: msg.key.id,
             from: msg.key.remoteJid,
+            messageType,
+            timestamp: msg.messageTimestamp,
+            pushName: msg.pushName || 'Unknown',
         })
         
         return true
