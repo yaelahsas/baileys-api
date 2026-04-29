@@ -233,7 +233,7 @@ const handleMessageUpsert = async (m, sessionId, wa, store) => {
     if (messageTmp.length > 0) {
         incoming('WhatsApp', `Received ${messageTmp.length} new message(s)`, {
             sessionId,
-            messages: messageTmp.map(msg => ({
+            messages: messageTmp.filter(msg => msg && msg.key).map(msg => ({
                 id: msg.key?.id,
                 from: msg.key?.remoteJid,
                 type: Object.keys(msg.message || {})[0],

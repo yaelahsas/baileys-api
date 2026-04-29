@@ -224,18 +224,18 @@ const handleGroupCommands = async (wa, msg, sessionId) => {
         }
 
         const text = messageContent.trim().toLowerCase()
-        const command = text.split(' ')[0]
+        const cmd = text.split(' ')[0]
 
         debug('CommandHandler', 'Text and command detected', {
             sessionId,
             text,
-            command,
+            command: cmd,
         })
 
-        if (!KNOWN_COMMANDS.includes(command)) {
+        if (!KNOWN_COMMANDS.includes(cmd)) {
             debug('CommandHandler', 'Unknown command, skipping', {
                 sessionId,
-                command,
+                command: cmd,
             })
             return false
         }
@@ -269,7 +269,7 @@ const handleGroupCommands = async (wa, msg, sessionId) => {
             sender,
         })
 
-        switch (command) {
+        switch (cmd) {
             case '/menu': {
                 command('CommandHandler', 'Processing /menu command', {
                     sessionId,
@@ -441,7 +441,7 @@ Atau dengan tanggal:
             default:
                 debug('CommandHandler', 'Unknown command after switch', {
                     sessionId,
-                    command,
+                    command: cmd,
                 })
                 return false
         }
