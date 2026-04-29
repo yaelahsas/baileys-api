@@ -226,7 +226,21 @@ const handleMessageUpsert = async (m, sessionId, wa, store) => {
         messageCount: messageTmp.length,
     })
 
+    // Send incoming messages to webhook
     callWebhook(sessionId, 'MESSAGES_UPSERT', messageTmp)
+    
+    // Log incoming messages for visibility
+    if (messageTmp.length > 0) {
+        incoming('WhatsApp', `Received ${messageTmp.length} new message(s)`, {
+            sessionId,
+            messages: messageTmp.map(msg => ({
+                id: msg.key?.id,
+                from: msg.key?.remoteJid,
+                type: Object.keys(msg.message || {})[0],
+                timestamp: msg.messageTimestamp
+            }))
+        })
+    }
 }
 
 /**
