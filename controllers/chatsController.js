@@ -3,6 +3,9 @@ import {
     getChatList,
     isExists,
     sendMessage,
+    sendMessageWithQueue,
+    getMessageStatus,
+    getQueueStats,
     formatPhone,
     formatGroup,
     readMessage,
@@ -46,11 +49,12 @@ const send = async (req, res) => {
             }
         }
 
-        await sendMessage(session, receiver, message, {}, 0)
+        // Use queue system for better concurrent request handling
+        const queueId = sendMessageWithQueue(session, receiver, message, {}, 0)
 
-        response(res, 200, true, 'The message has been successfully sent.')
+        response(res, 200, true, 'The message has been queued for sending.', { queueId })
     } catch {
-        response(res, 500, false, 'Failed to send the message.')
+        response(res, 500, false, 'Failed to queue the message.')
     }
 }
 
@@ -193,4 +197,35 @@ const downloadMedia = async (req, res) => {
     }
 }
 
-export { getList, send, sendBulk, deleteChat, read, forward, sendPresence, downloadMedia }
+/**
+ * Get the status of a queued message
+ */
+const getMessageQueueStatus = async (req, res) => {
+    const { queueId } = req.params
+
+    try {
+        const status = getMessageStatus(queueId)
+
+        if (!status) {
+            return response(res, 404, false, 'Message not found in queue')
+        }
+
+        response(res, 200, true, 'Message status retrieved successfully', status)
+    } catch (error) {
+        response(res, 500, false, 'Failed to get message status', { error: error.message })
+    }
+}
+
+/**
+ * Get queue statistics
+ */
+const getQueueStatistics = async (req, res) => {
+    try {
+        const stats = getQueueStats()
+        response(res, 200, true, 'Queue statistics retrieved successfully', stats)
+    } catch (error) {
+        response(res, 500, false, 'Failed to get queue statistics', { error: error.message })
+    }
+}
+
+export { getList, send, sendBulk, deleteChat, read, forward, sendPresence, downloadMedia, getMessageQueueStatus, getQueueStatistics }

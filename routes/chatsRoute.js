@@ -73,4 +73,20 @@ router.post(
     controller.downloadMedia
 )
 
+router.get(
+    '/queue/status/:queueId',
+    query('id').notEmpty(),
+    requestValidator,
+    sessionValidator,
+    controller.getMessageQueueStatus
+)
+
+router.get(
+    '/queue/stats',
+    query('id').notEmpty(),
+    requestValidator,
+    sessionValidator,
+    controller.getQueueStatistics
+)
+
 export default router

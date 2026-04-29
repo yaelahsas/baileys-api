@@ -20,12 +20,14 @@
         "node": ">=18.16.0"
     },
     "dependencies": {
-        "baileys": "7.0.0-rc.6",
         "axios": "^1.13.2",
+        "baileys": "7.0.0-rc.6",
+        "chalk": "^5.3.0",
         "cors": "^2.8.5",
         "dotenv": "^17.2.3",
         "express": "^5.1.0",
         "express-validator": "^7.3.0",
+        "form-data": "^4.0.5",
         "node-cache": "^5.1.2",
         "node-cleanup": "^2.1.2",
         "pino": "^10.1.0",
