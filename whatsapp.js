@@ -98,6 +98,13 @@ import proto from 'baileys'
 const BOT_START_TIME = Math.floor(Date.now() / 1000)
 
 /**
+ * Track which sessions have been fully set up with event handlers
+ * This prevents duplicate handler registration on reconnection
+ * @type {Set<string>}
+ */
+const setupSessions = new Set()
+
+/**
  * Message upsert handler
  * Processes incoming messages and routes them to appropriate handlers
  * 
@@ -122,6 +129,10 @@ const handleMessageUpsert = async (m, sessionId, wa, store) => {
         return
     }
 
+    // Always get the latest session to avoid stale references after reconnection
+    const currentWa = sessionManager.getSession(sessionId) || wa
+    const currentStore = currentWa?.store || store
+
     // Filter messages
     const messages = filterMessages(m.messages)
 
@@ -139,7 +150,7 @@ const handleMessageUpsert = async (m, sessionId, wa, store) => {
     }
 
     // Auto read messages if enabled
-    await autoReadMessages(wa, messages)
+    await autoReadMessages(currentWa, messages)
 
     // Process each message
     const messageTmp = await Promise.all(
@@ -166,7 +177,7 @@ const handleMessageUpsert = async (m, sessionId, wa, store) => {
                         sessionId,
                         groupId: msg.key.remoteJid,
                     })
-                    await handleGroupImageMessage(wa, msg, sessionId)
+                    await handleGroupImageMessage(currentWa, msg, sessionId)
                     debug('WhatsApp', 'handleGroupImageMessage completed', {
                         sessionId,
                     })
@@ -182,7 +193,7 @@ const handleMessageUpsert = async (m, sessionId, wa, store) => {
                         groupId: msg.key.remoteJid,
                     })
 
-                    const handled = await handleGroupCommands(wa, msg, sessionId)
+                    const handled = await handleGroupCommands(currentWa, msg, sessionId)
 
                     if (handled) {
                         debug('WhatsApp', 'Message processed as command', {
@@ -201,7 +212,7 @@ const handleMessageUpsert = async (m, sessionId, wa, store) => {
                     ['documentMessage', 'imageMessage', 'videoMessage', 'audioMessage'].includes(typeMessage) &&
                     process.env.APP_WEBHOOK_FILE_IN_BASE64 === 'true'
                 ) {
-                    return await processMediaForWebhook(wa, msg, typeMessage)
+                    return await processMediaForWebhook(currentWa, msg, typeMessage)
                 }
 
                 debug('WhatsApp', 'Message processing completed', {
@@ -246,6 +257,7 @@ const handleMessageUpsert = async (m, sessionId, wa, store) => {
 /**
  * Connection update handler
  * Handles connection state changes and reconnection logic
+ * Re-registers event listeners after successful reconnection
  * 
  * @param {object} update - Connection update object
  * @param {string} sessionId - The session ID
@@ -253,50 +265,58 @@ const handleMessageUpsert = async (m, sessionId, wa, store) => {
  * @param {object} store - The message store
  */
 const handleConnectionUpdate = async (update, sessionId, wa, store) => {
+    const { connection, lastDisconnect } = update
+
     event('WhatsApp', 'Connection update received', {
         sessionId,
-        connection: update.connection,
+        connection,
+        statusCode: lastDisconnect?.error?.output?.statusCode,
     })
+
+    if (connection === 'open') {
+        // Always get the latest session from sessionManager to ensure
+        // we're working with the current socket (not a stale reference)
+        const currentWa = sessionManager.getSession(sessionId) || wa
+
+        // When connection is open (or re-opened after reconnection),
+        // we need to ensure all event handlers are properly registered
+        // The sessionManager already handles the socket creation,
+        // but we need to re-register the additional event listeners
+        // that are set up in createSession() from this module
+        if (setupSessions.has(sessionId)) {
+            // Session was already set up, but reconnected - re-register handlers
+            info('WhatsApp', 'Session reconnected, re-registering event handlers', {
+                sessionId,
+            })
+            registerSessionHandlers(sessionId, currentWa)
+        }
+    }
+
+    if (connection === 'close') {
+        warning('WhatsApp', 'Connection closed, sessionManager will handle reconnection', {
+            sessionId,
+            statusCode: lastDisconnect?.error?.output?.statusCode,
+        })
+    }
 }
 
 /**
- * Create a new WhatsApp session with all handlers
- * 
- * @param {string} sessionId - Unique identifier for the session
- * @param {object} res - Express response object (optional)
- * @param {object} options - Session creation options
- * @param {boolean} options.usePairingCode - Whether to use pairing code instead of QR
- * @param {string} options.phoneNumber - Phone number for pairing code
- * @returns {Promise<import('baileys').AnyWASocket>} The created session
+ * Register all event handlers for a session
+ * This is called both on initial creation and after reconnection
+ *
+ * @param {string} sessionId - The session ID
+ * @param {import('baileys').AnyWASocket} wa - The WhatsApp session
  */
-const createSession = async (
-    sessionId,
-    res = null,
-    options = { usePairingCode: false, phoneNumber: '' }
-) => {
-    info('WhatsApp', 'Creating new session with handlers', {
-        sessionId,
-        usePairingCode: options.usePairingCode,
-        phoneNumber: options.phoneNumber,
-    })
+const registerSessionHandlers = (sessionId, wa) => {
+    // Remove existing listeners to prevent duplicates
+    wa.ev.removeAllListeners('messages.update')
+    wa.ev.removeAllListeners('message-receipt.update')
+    wa.ev.removeAllListeners('messages.upsert')
 
-    const wa = await sessionManager.createSession(
-        sessionId,
-        res,
-        options,
-        (m) => handleMessageUpsert(m, sessionId, wa, wa.store),
-        (update) => handleConnectionUpdate(update, sessionId, wa, wa.store),
-        (instance, type, data) => callWebhook(instance, type, data)
-    )
+    // Re-register messages.upsert handler (critical for message detection)
+    wa.ev.on('messages.upsert', (m) => handleMessageUpsert(m, sessionId, wa, wa.store))
 
-    // Setup additional event listeners
-    setupEventListeners(wa, sessionId, (instance, type, data) => callWebhook(instance, type, data))
-
-    success('WhatsApp', 'Session created with all handlers', {
-        sessionId,
-    })
-
-    // Handle message updates with poll aggregation
+    // Setup messages.update handler
     wa.ev.on('messages.update', async (m) => {
         debug('WhatsApp', 'messages.update event received', {
             sessionId,
@@ -334,7 +354,7 @@ const createSession = async (
         }
     })
 
-    // Handle message receipt updates with poll aggregation
+    // Setup message-receipt.update handler
     wa.ev.on('message-receipt.update', async (m) => {
         debug('WhatsApp', 'message-receipt.update event received', {
             sessionId,
@@ -369,6 +389,85 @@ const createSession = async (
         callWebhook(sessionId, 'MESSAGES_RECEIPT_UPDATE', m)
     })
 
+    // Setup additional event listeners (webhook events)
+    // Remove existing webhook listeners first to prevent duplicates
+    const webhookEvents = [
+        'chats.set', 'chats.upsert', 'chats.delete', 'chats.update',
+        'labels.association', 'labels.edit',
+        'messages.delete', 'messages.reaction', 'messages.media-update',
+        'messaging-history.set',
+        'groups.upsert', 'groups.update', 'group-participants.update',
+        'blocklist.set', 'blocklist.update',
+        'contacts.set', 'contacts.upsert', 'contacts.update',
+        'presence.update',
+    ]
+    
+    for (const eventName of webhookEvents) {
+        wa.ev.removeAllListeners(eventName)
+    }
+    
+    setupEventListeners(wa, sessionId, (instance, type, data) => callWebhook(instance, type, data))
+
+    debug('WhatsApp', 'All session handlers registered', {
+        sessionId,
+    })
+}
+
+/**
+ * Create a new WhatsApp session with all handlers
+ *
+ * @param {string} sessionId - Unique identifier for the session
+ * @param {object} res - Express response object (optional)
+ * @param {object} options - Session creation options
+ * @param {boolean} options.usePairingCode - Whether to use pairing code instead of QR
+ * @param {string} options.phoneNumber - Phone number for pairing code
+ * @returns {Promise<import('baileys').AnyWASocket>} The created session
+ */
+const createSession = async (
+    sessionId,
+    res = null,
+    options = { usePairingCode: false, phoneNumber: '' }
+) => {
+    info('WhatsApp', 'Creating new session with handlers', {
+        sessionId,
+        usePairingCode: options.usePairingCode,
+        phoneNumber: options.phoneNumber,
+    })
+
+    // Store callbacks in sessionManager so reconnection uses the correct handlers
+    // These callbacks use sessionManager.getSession() internally to avoid stale references
+    const onMessageUpsert = (m) => {
+        const currentWa = sessionManager.getSession(sessionId)
+        handleMessageUpsert(m, sessionId, currentWa, currentWa?.store)
+    }
+    const onConnectionUpdate = (update) => {
+        const currentWa = sessionManager.getSession(sessionId)
+        handleConnectionUpdate(update, sessionId, currentWa, currentWa?.store)
+    }
+    const onWebhook = (instance, type, data) => callWebhook(instance, type, data)
+
+    // Update callbacks in sessionManager before creating the session
+    sessionManager.updateCallbacks(sessionId, onMessageUpsert, onConnectionUpdate, onWebhook)
+
+    const wa = await sessionManager.createSession(
+        sessionId,
+        res,
+        options,
+        onMessageUpsert,
+        onConnectionUpdate,
+        onWebhook
+    )
+
+    // Register all session handlers
+    registerSessionHandlers(sessionId, wa)
+
+    // Mark session as set up
+    setupSessions.add(sessionId)
+
+    success('WhatsApp', 'Session created with all handlers', {
+        sessionId,
+    })
+
     return wa
 }
 
@@ -380,15 +479,11 @@ const init = () => {
         botStartTime: new Date(BOT_START_TIME * 1000).toISOString(),
     })
 
+    // Pass null callbacks to sessionManager.init() - they will be set up properly
+    // in the setTimeout below after sessions are restored
     sessionManager.init(
-        (m) => {
-            // Message upsert handler - will be processed per session
-            // This is a placeholder that will be overridden by per-session handlers
-        },
-        (update) => {
-            // Connection update handler - will be processed per session
-            // This is a placeholder that will be overridden by per-session handlers
-        },
+        null,
+        null,
         (instance, type, data) => {
             callWebhook(instance, type, data)
         }
@@ -404,89 +499,33 @@ const init = () => {
         sessionIds.forEach(sessionId => {
             const wa = sessionManager.getSession(sessionId)
             if (wa) {
+                // Create proper callbacks that always get the latest session reference
+                const onMessageUpsert = (m) => {
+                    const currentWa = sessionManager.getSession(sessionId)
+                    handleMessageUpsert(m, sessionId, currentWa, currentWa?.store)
+                }
+                const onConnectionUpdate = (update) => {
+                    const currentWa = sessionManager.getSession(sessionId)
+                    handleConnectionUpdate(update, sessionId, currentWa, currentWa?.store)
+                }
+                const onWebhook = (instance, type, data) => callWebhook(instance, type, data)
+
+                // Update callbacks in sessionManager for reconnection use
+                sessionManager.updateCallbacks(sessionId, onMessageUpsert, onConnectionUpdate, onWebhook)
+
                 // Remove existing messages.upsert listeners and add proper handler
                 wa.ev.removeAllListeners('messages.upsert')
-                wa.ev.on('messages.upsert', (m) => handleMessageUpsert(m, sessionId, wa, wa.store))
+                wa.ev.on('messages.upsert', onMessageUpsert)
 
                 // Remove existing connection.update listeners and add proper handler
                 wa.ev.removeAllListeners('connection.update')
-                wa.ev.on('connection.update', (update) => handleConnectionUpdate(update, sessionId, wa, wa.store))
+                wa.ev.on('connection.update', onConnectionUpdate)
 
-                // Setup additional event listeners
-                setupEventListeners(wa, sessionId, (instance, type, data) => callWebhook(instance, type, data))
+                // Register all other session handlers
+                registerSessionHandlers(sessionId, wa)
 
-                // Setup messages.update handler
-                wa.ev.on('messages.update', async (m) => {
-                    debug('WhatsApp', 'messages.update event received', {
-                        sessionId,
-                        updateCount: m.length,
-                    })
-
-                    for (const { key, update } of m) {
-                        const getMessage = (key) => {
-                            if (wa.store) {
-                                const msg = wa.store.loadMessages(key.remoteJid, key.id)
-                                return msg?.message || undefined
-                            }
-                            return proto.Message.fromObject({})
-                        }
-
-                        const msg = await getMessage(key)
-
-                        if (!msg) {
-                            debug('WhatsApp', 'Message not found in store', {
-                                sessionId,
-                                messageId: key.id,
-                            })
-                            continue
-                        }
-
-                        update.status = WAMessageStatus[update.status]
-                        const messagesUpdate = [
-                            {
-                                key,
-                                update,
-                                message: msg,
-                            },
-                        ]
-                        callWebhook(sessionId, 'MESSAGES_UPDATE', messagesUpdate)
-                    }
-                })
-
-                // Setup message-receipt.update handler
-                wa.ev.on('message-receipt.update', async (m) => {
-                    debug('WhatsApp', 'message-receipt.update event received', {
-                        sessionId,
-                        receiptCount: m.length,
-                    })
-
-                    const getMessage = (key) => {
-                        if (wa.store) {
-                            const msg = wa.store.loadMessages(key.remoteJid, key.id)
-                            return msg?.message || undefined
-                        }
-                        return proto.Message.fromObject({})
-                    }
-
-                    for (const { key, messageTimestamp, pushName, broadcast, update } of m) {
-                        if (update?.pollUpdates) {
-                            const pollCreation = await getMessage(key)
-                            if (pollCreation) {
-                                const pollMessage = await getAggregateVotesInPollMessage({
-                                    message: pollCreation,
-                                    pollUpdates: update.pollUpdates,
-                                })
-                                update.pollUpdates[0].vote = pollMessage
-                                callWebhook(sessionId, 'MESSAGES_RECEIPT_UPDATE', [
-                                    { key, messageTimestamp, pushName, broadcast, update },
-                                ])
-                                return
-                            }
-                        }
-                    }
-
-                    callWebhook(sessionId, 'MESSAGES_RECEIPT_UPDATE', m)
-                })
+                // Mark session as set up
+                setupSessions.add(sessionId)
 
                 success('WhatsApp', 'Handlers set up for restored session', {
                     sessionId,

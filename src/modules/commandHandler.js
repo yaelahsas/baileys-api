@@ -2,9 +2,11 @@
  * Command Handler Module
  *
  * This module handles all command-related operations including:
- * - Processing group commands (#laporan, #jurnal)
+ * - Processing group commands (#laporan, #jurnal, #jurnal-daring, #ekstra)
  * - Command validation and authorization
  * - Command-specific business logic
+ * - Metode pembelajaran: luring (default) atau daring
+ * - Jenis jurnal: akademik (default) atau non_akademik
  */
 
 import axios from 'axios'
@@ -32,7 +34,7 @@ const AUTHORIZED_NUMBERS = ['6285212870484', '6283853399847']
  * Known commands that the bot recognizes
  * @type {Array<string>}
  */
-const KNOWN_COMMANDS = ['#laporan', '#jurnal', '/menu', '/billing', '/today']
+const KNOWN_COMMANDS = ['#laporan', '#jurnal', '#jurnal-daring', '#ekstra', '/menu', '/billing', '/today']
 
 /**
  * Month name to number mapping for Indonesian months
@@ -55,14 +57,15 @@ const MONTH_MAP = {
 
 /**
  * API configuration for external services
+ * Reads from environment variables first, falls back to hardcoded defaults
  * @type {object}
  */
 const API_CONFIG = {
-    base_url: 'http://10.46.1.16:9998/api',
-    api_key: 'whatsapp_bot_key_2024',
-    timeout: 30000, // 30 seconds timeout
-    max_retries: 3, // Maximum retry attempts
-    retry_delay: 2000, // Delay between retries in ms
+    base_url: process.env.API_BASE_URL || 'http://sim-mtsn.test/api',
+    api_key: process.env.API_KEY || 'whatsapp_bot_key_2024',
+    timeout: parseInt(process.env.API_TIMEOUT) || 30000, // 30 seconds timeout
+    max_retries: parseInt(process.env.API_MAX_RETRIES) || 3, // Maximum retry attempts
+    retry_delay: parseInt(process.env.API_RETRY_DELAY) || 2000, // Delay between retries in ms
 }
 
 /**
@@ -351,7 +354,7 @@ const handleGroupCommands = async (wa, msg, sessionId) => {
             }
 
             case '#jurnal': {
-                command('CommandHandler', 'Processing #jurnal command', {
+                command('CommandHandler', 'Processing #jurnal command (luring, akademik)', {
                     sessionId,
                 })
 
@@ -424,12 +427,188 @@ Atau dengan tanggal:
                 })
 
                 try {
-                    await handleGroupImageMessage(wa, msg, sessionId, tanggalFinal)
+                    await handleGroupImageMessage(wa, msg, sessionId, tanggalFinal, 'luring', 'akademik')
                     success('CommandHandler', '#jurnal command processed successfully', {
                         sessionId,
                     })
                 } catch (err) {
                     error('CommandHandler', 'handleGroupImageMessage failed', {
+                        sessionId,
+                        error: err.message,
+                    })
+                }
+
+                return true
+            }
+
+            case '#jurnal-daring': {
+                command('CommandHandler', 'Processing #jurnal-daring command (daring, akademik)', {
+                    sessionId,
+                })
+
+                const partsDaring = text.split(' ')
+                let tanggalInputDaring = null
+
+                if (partsDaring.length > 1) {
+                    tanggalInputDaring = partsDaring[1]
+                }
+
+                let tanggalFinalDaring = null
+
+                if (tanggalInputDaring) {
+                    const regex = /^(\d{2})-(\d{2})-(\d{4})$/
+
+                    if (regex.test(tanggalInputDaring)) {
+                        const [dd, mm, yyyy] = tanggalInputDaring.split('-')
+                        tanggalFinalDaring = `${yyyy}-${mm}-${dd}`
+
+                        info('CommandHandler', 'Custom date detected for daring', {
+                            sessionId,
+                            customDate: tanggalFinalDaring,
+                        })
+                    }
+                }
+
+                // Check if there's a quoted message
+                const quotedDaring = msg.message?.extendedTextMessage?.contextInfo?.quotedMessage
+
+                debug('CommandHandler', 'Checking for quoted message (daring)', {
+                    sessionId,
+                    hasQuoted: !!quotedDaring,
+                })
+
+                if (!quotedDaring) {
+                    warning('CommandHandler', '#jurnal-daring without image reply', {
+                        sessionId,
+                    })
+
+                    await wa.sendMessage(msg.key.remoteJid, {
+                        text: `Format salah.
+
+Gunakan:
+Reply gambar dengan:
+
+#jurnal-daring 7h matematika algoritma dasar
+
+Atau dengan tanggal:
+
+#jurnal-daring 06-02-2026 7h matematika algoritma dasar`,
+                    })
+
+                    return true
+                }
+
+                if (!quotedDaring.imageMessage) {
+                    warning('CommandHandler', 'Quoted message is not an image (daring)', {
+                        sessionId,
+                    })
+
+                    await wa.sendMessage(msg.key.remoteJid, {
+                        text: 'Pesan yang direply bukan gambar. Mohon reply pesan gambar.',
+                    })
+
+                    return true
+                }
+
+                debug('CommandHandler', 'Valid #jurnal-daring command, proceeding to handleGroupImageMessage', {
+                    sessionId,
+                })
+
+                try {
+                    await handleGroupImageMessage(wa, msg, sessionId, tanggalFinalDaring, 'daring', 'akademik')
+                    success('CommandHandler', '#jurnal-daring command processed successfully', {
+                        sessionId,
+                    })
+                } catch (err) {
+                    error('CommandHandler', 'handleGroupImageMessage failed (daring)', {
+                        sessionId,
+                        error: err.message,
+                    })
+                }
+
+                return true
+            }
+
+            case '#ekstra': {
+                command('CommandHandler', 'Processing #ekstra command (luring, non_akademik)', {
+                    sessionId,
+                })
+
+                const partsEkstra = text.split(' ')
+                let tanggalInputEkstra = null
+
+                if (partsEkstra.length > 1) {
+                    tanggalInputEkstra = partsEkstra[1]
+                }
+
+                let tanggalFinalEkstra = null
+
+                if (tanggalInputEkstra) {
+                    const regex = /^(\d{2})-(\d{2})-(\d{4})$/
+
+                    if (regex.test(tanggalInputEkstra)) {
+                        const [dd, mm, yyyy] = tanggalInputEkstra.split('-')
+                        tanggalFinalEkstra = `${yyyy}-${mm}-${dd}`
+
+                        info('CommandHandler', 'Custom date detected for ekstra', {
+                            sessionId,
+                            customDate: tanggalFinalEkstra,
+                        })
+                    }
+                }
+
+                // Check if there's a quoted message
+                const quotedEkstra = msg.message?.extendedTextMessage?.contextInfo?.quotedMessage
+
+                debug('CommandHandler', 'Checking for quoted message (ekstra)', {
+                    sessionId,
+                    hasQuoted: !!quotedEkstra,
+                })
+
+                if (!quotedEkstra) {
+                    warning('CommandHandler', '#ekstra without image reply', {
+                        sessionId,
+                    })
+
+                    await wa.sendMessage(msg.key.remoteJid, {
+                        text: `Format salah.
+
+Gunakan:
+Reply gambar dengan:
+
+#ekstra pramuka pengenalan tali temali
+
+Atau dengan tanggal:
+
+#ekstra 06-02-2026 pramuka pengenalan tali temali`,
+                    })
+
+                    return true
+                }
+
+                if (!quotedEkstra.imageMessage) {
+                    warning('CommandHandler', 'Quoted message is not an image (ekstra)', {
+                        sessionId,
+                    })
+
+                    await wa.sendMessage(msg.key.remoteJid, {
+                        text: 'Pesan yang direply bukan gambar. Mohon reply pesan gambar.',
+                    })
+
+                    return true
+                }
+
+                debug('CommandHandler', 'Valid #ekstra command, proceeding to handleGroupImageMessage', {
+                    sessionId,
+                })
+
+                try {
+                    await handleGroupImageMessage(wa, msg, sessionId, tanggalFinalEkstra, 'luring', 'non_akademik')
+                    success('CommandHandler', '#ekstra command processed successfully', {
+                        sessionId,
+                    })
+                } catch (err) {
+                    error('CommandHandler', 'handleGroupImageMessage failed (ekstra)', {
                         sessionId,
                         error: err.message,
                     })
@@ -466,8 +645,10 @@ Atau dengan tanggal:
  * @param {object} msg - The message object
  * @param {string} sessionId - The session ID
  * @param {string|null} tanggalCustom - Custom date in YYYY-MM-DD format
+ * @param {string} metode - Metode pembelajaran: 'luring' (default) atau 'daring'
+ * @param {string} jenis - Jenis jurnal: 'akademik' (default) atau 'non_akademik'
  */
-const handleGroupImageMessage = async (wa, msg, sessionId, tanggalCustom = null) => {
+const handleGroupImageMessage = async (wa, msg, sessionId, tanggalCustom = null, metode = 'luring', jenis = 'akademik') => {
     try {
         console.log('==============================================')
         console.log('[JURNAL] Memulai proses input jurnal')
@@ -595,26 +776,9 @@ const handleGroupImageMessage = async (wa, msg, sessionId, tanggalCustom = null)
             console.log('[INFO] Parsing dari COMMAND:', text)
         }
 
+        // If no text/caption, silently ignore the image-only message
         if (!text) {
-            await wa.sendMessage(
-                msg.key.remoteJid,
-                {
-                    text: `❌ Format salah.
-
-Gunakan salah satu format:
-
-📌 Kirim gambar dengan caption:
-7h matematika algoritma dasar atau olim-mtk matematika dasar
-
-📌 Reply gambar dengan:
-#jurnal 7h matematika algoritma dasar
-
-📌 Dengan tanggal custom:
-#jurnal 06-02-2026 7h matematika algoritma dasar`,
-                },
-                { quoted: msg },
-            )
-
+            console.log('[INFO] Gambar tanpa caption, diabaikan')
             return
         }
 
@@ -652,6 +816,77 @@ Atau dengan tanggal:
                 return
             }
         }
+        // Mode COMMAND #JURNAL-DARING
+        else if (parts[0].toLowerCase() === '#jurnal-daring') {
+            console.log('[INFO] Mode COMMAND #jurnal-daring terdeteksi')
+
+            if (parts.length >= 2) {
+                const parsedDate = parseDate(parts[1])
+                if (parsedDate) {
+                    tanggalKirim = parsedDate
+                    kelas = parts[2] || ''
+                    materi = parts.slice(3).join(' ')
+                    console.log('[INFO] Tanggal custom (daring):', tanggalKirim)
+                } else {
+                    kelas = parts[1] || ''
+                    materi = parts.slice(2).join(' ')
+                }
+            } else {
+                await wa.sendMessage(
+                    msg.key.remoteJid,
+                    {
+                        text: `❌ Format salah.
+
+Gunakan:
+#jurnal-daring 7h matematika algoritma dasar
+
+Atau dengan tanggal:
+#jurnal-daring 06-02-2026 7h matematika algoritma dasar`,
+                    },
+                    { quoted: msg },
+                )
+                return
+            }
+        }
+        // Mode COMMAND #EKSTRA (tanpa kelas, hanya materi)
+        else if (parts[0].toLowerCase() === '#ekstra') {
+            console.log('[INFO] Mode COMMAND #ekstra terdeteksi')
+
+            if (parts.length >= 2) {
+                const parsedDate = parseDate(parts[1])
+                if (parsedDate) {
+                    tanggalKirim = parsedDate
+                    kelas = '' // kelas kosong untuk ekstra
+                    materi = parts.slice(2).join(' ')
+                    console.log('[INFO] Tanggal custom (ekstra):', tanggalKirim)
+                } else {
+                    kelas = '' // kelas kosong untuk ekstra
+                    materi = parts.slice(1).join(' ')
+                }
+            } else {
+                await wa.sendMessage(
+                    msg.key.remoteJid,
+                    {
+                        text: `❌ Format salah.
+
+Gunakan:
+#ekstra pramuka pengenalan tali temali
+
+Atau dengan tanggal:
+#ekstra 06-02-2026 pramuka pengenalan tali temali`,
+                    },
+                    { quoted: msg },
+                )
+                return
+            }
+        }
+        // Mode CAPTION DARING (daring [kelas] [materi])
+        else if (parts[0].toLowerCase() === 'daring') {
+            console.log('[INFO] Mode CAPTION daring terdeteksi')
+            metode = 'daring'
+            kelas = parts[1] || ''
+            materi = parts.slice(2).join(' ')
+        }
         // Mode CAPTION LANGSUNG
         else {
             kelas = parts[0] || ''
@@ -661,9 +896,9 @@ Atau dengan tanggal:
         kelas = sanitizeText(mapAliasKelas(kelas))
         materi = sanitizeText(materi)
 
-        // Validate parsing result
-        if (!kelas || !materi) {
-            console.log('[ERROR] Format parsing gagal:', { kelas, materi })
+        // Validate parsing result (kelas optional untuk non_akademik/ekstra)
+        if ((!kelas && jenis !== 'non_akademik') || !materi) {
+            console.log('[ERROR] Format parsing gagal:', { kelas, materi, jenis })
 
             await wa.sendMessage(
                 msg.key.remoteJid,
@@ -672,14 +907,21 @@ Atau dengan tanggal:
 
 Contoh yang benar:
 
-📌 Kirim gambar langsung:
+📌 Kirim gambar langsung (luring/akademik):
 7h matematika algoritma dasar atau olim-mtk matematika dasar
+
+📌 Caption daring:
+daring 7h matematika algoritma dasar
 
 📌 Atau dengan reply:
 #jurnal 7h matematika algoritma dasar
+#jurnal-daring 7h matematika algoritma dasar
+#ekstra pramuka pengenalan tali temali
 
 📌 Tanggal custom:
-#jurnal 06-02-2026 7h matematika algoritma dasar`,
+#jurnal 06-02-2026 7h matematika algoritma dasar
+#jurnal-daring 06-02-2026 7h matematika algoritma dasar
+#ekstra 06-02-2026 pramuka pengenalan tali temali`,
                 },
                 { quoted: msg },
             )
@@ -697,6 +939,8 @@ Contoh yang benar:
         console.log('- Kelas  :', kelas)
         console.log('- Materi :', materi)
         console.log('- Tanggal:', tanggalKirim)
+        console.log('- Metode :', metode)
+        console.log('- Jenis  :', jenis)
 
         // Send to API with retry logic
         const data = {
@@ -706,6 +950,8 @@ Contoh yang benar:
             keterangan: 'Jurnal via WhatsApp Bot',
             foto: `data:${mediaMessage.mimetype};base64,${mediaMessage.base64}`,
             tanggal: tanggalKirim,
+            metode: metode,
+            jenis: jenis,
         }
 
         console.log('[INFO] Mengirim data ke API dengan retry logic...')
@@ -729,10 +975,12 @@ Contoh yang benar:
 
                 const successMessage =
                     `✅ Jurnal berhasil disimpan\n\n` +
-                    `👨‍🏫 Guru  : ${jurnalData.nama_guru}\n` +
-                    `🏫 Kelas : ${kelas}\n` +
-                    `📚 Materi: ${materi}\n` +
-                    `📅 Tgl   : ${jurnalData.tanggal}`
+                    `👨‍🏫 Guru   : ${jurnalData.nama_guru}\n` +
+                    (kelas ? `🏫 Kelas  : ${kelas}\n` : '') +
+                    `📚 Materi : ${materi}\n` +
+                    `📅 Tgl    : ${jurnalData.tanggal}\n` +
+                    `💻 Metode : ${metode === 'daring' ? 'Daring' : 'Luring'}\n` +
+                    `📋 Jenis  : ${jenis === 'non_akademik' ? 'Non-Akademik' : 'Akademik'}`
 
                 await wa.sendMessage(msg.key.remoteJid, { text: successMessage }, { quoted: msg })
 
@@ -805,11 +1053,22 @@ const handleMenuCommand = async (wa, msg) => {
             `📅 */today* - Melihat siapa yang sudah mengisi jurnal hari ini\n` +
             `   Format: /today\n` +
             `   Menampilkan daftar guru yang sudah submit jurnal hari ini\n\n` +
-            `📝 *#jurnal* - Input jurnal dengan gambar\n` +
+            `📝 *#jurnal* - Input jurnal luring/akademik dengan gambar\n` +
             `   Format: #jurnal [tanggal] kelas materi\n` +
             `   Contoh: #jurnal 7h matematika algoritma dasar\n` +
             `   Contoh: #jurnal 06-02-2026 7h matematika algoritma dasar\n\n` +
-            `📌 *Catatan:*\n` +
+            `💻 *#jurnal-daring* - Input jurnal daring/akademik dengan gambar\n` +
+            `   Format: #jurnal-daring [tanggal] kelas materi\n` +
+            `   Contoh: #jurnal-daring 7h matematika algoritma dasar\n` +
+            `   Contoh: #jurnal-daring 06-02-2026 7h matematika algoritma dasar\n\n` +
+            `🏅 *#ekstra* - Input jurnal luring/non-akademik (ekstrakurikuler) dengan gambar\n` +
+            `   Format: #ekstra [tanggal] materi\n` +
+            `   Contoh: #ekstra pramuka pengenalan tali temali\n` +
+            `   Contoh: #ekstra 06-02-2026 pramuka pengenalan tali temali\n\n` +
+            `📌 *Caption langsung pada gambar:*\n` +
+            `   Luring/Akademik: 7h matematika algoritma dasar\n` +
+            `   Daring/Akademik: daring 7h matematika algoritma dasar\n\n` +
+            ` *Catatan:*\n` +
             `   - Gunakan format tanggal DD-MM-YYYY untuk tanggal custom\n` +
             `   - Reply gambar untuk input jurnal\n` +
             `   - Nama bulan: januari, februari, maret, dst.\n` +

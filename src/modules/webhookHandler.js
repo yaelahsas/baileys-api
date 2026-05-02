@@ -18,6 +18,12 @@ import {
 } from '../utils/logger.js'
 
 /**
+ * Whether webhook is enabled from environment
+ * @type {boolean}
+ */
+const APP_WEBHOOK_ENABLED = process.env.APP_WEBHOOK_ENABLED !== 'false'
+
+/**
  * Allowed webhook events from environment
  * @type {Array<string>}
  */
@@ -34,6 +40,11 @@ const APP_WEBHOOK_ALLOWED_EVENTS = process.env.APP_WEBHOOK_ALLOWED_EVENTS
  * @returns {Promise<object>} Response from webhook or error
  */
 const webhook = async (instance, type, data) => {
+    if (!APP_WEBHOOK_ENABLED) {
+        debug('WebhookHandler', 'Webhook is disabled, skipping')
+        return
+    }
+
     if (process.env.APP_WEBHOOK_URL) {
         const webhookUrl = process.env.APP_WEBHOOK_URL
         
@@ -81,6 +92,10 @@ const webhook = async (instance, type, data) => {
  * @returns {Promise<void>}
  */
 const callWebhook = async (instance, eventType, eventData) => {
+    if (!APP_WEBHOOK_ENABLED) {
+        return
+    }
+
     if (APP_WEBHOOK_ALLOWED_EVENTS.includes('ALL') || APP_WEBHOOK_ALLOWED_EVENTS.includes(eventType)) {
         debug('WebhookHandler', 'Calling webhook for event', {
             instance,
