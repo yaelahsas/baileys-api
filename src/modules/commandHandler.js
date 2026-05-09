@@ -360,9 +360,23 @@ const handleGroupCommands = async (wa, msg, sessionId) => {
 
                 const parts = text.split(' ')
                 let tanggalInput = null
+                let customLid = null
 
-                if (parts.length > 1) {
-                    tanggalInput = parts[1]
+                // Extract custom LID from @mention
+                const mentionedJid = msg.message?.extendedTextMessage?.contextInfo?.mentionedJid
+                if (mentionedJid && mentionedJid.length > 0) {
+                    customLid = mentionedJid[0].replace(/@.*$/, '')
+                    info('CommandHandler', 'Custom LID from @mention', {
+                        sessionId,
+                        customLid,
+                    })
+                }
+
+                // Parse arguments after command, skipping @mention parts
+                const argParts = parts.slice(1).filter((p) => !p.startsWith('@'))
+
+                if (argParts.length > 0) {
+                    tanggalInput = argParts[0]
                 }
 
                 let tanggalFinal = null
@@ -404,7 +418,12 @@ Reply gambar dengan:
 
 Atau dengan tanggal:
 
-#jurnal 06-02-2026 7h matematika algoritma dasar`,
+#jurnal 06-02-2026 7h matematika algoritma dasar
+
+Atau untuk guru lain (tag @guru):
+
+#jurnal @628xxx 7h matematika algoritma dasar
+#jurnal @628xxx 06-02-2026 7h matematika algoritma dasar`,
                     })
 
                     return true
@@ -427,7 +446,7 @@ Atau dengan tanggal:
                 })
 
                 try {
-                    await handleGroupImageMessage(wa, msg, sessionId, tanggalFinal, 'luring', 'akademik')
+                    await handleGroupImageMessage(wa, msg, sessionId, tanggalFinal, 'luring', 'akademik', customLid)
                     success('CommandHandler', '#jurnal command processed successfully', {
                         sessionId,
                     })
@@ -448,9 +467,23 @@ Atau dengan tanggal:
 
                 const partsDaring = text.split(' ')
                 let tanggalInputDaring = null
+                let customLidDaring = null
 
-                if (partsDaring.length > 1) {
-                    tanggalInputDaring = partsDaring[1]
+                // Extract custom LID from @mention
+                const mentionedJidDaring = msg.message?.extendedTextMessage?.contextInfo?.mentionedJid
+                if (mentionedJidDaring && mentionedJidDaring.length > 0) {
+                    customLidDaring = mentionedJidDaring[0].replace(/@.*$/, '')
+                    info('CommandHandler', 'Custom LID from @mention (daring)', {
+                        sessionId,
+                        customLid: customLidDaring,
+                    })
+                }
+
+                // Parse arguments after command, skipping @mention parts
+                const argPartsDaring = partsDaring.slice(1).filter((p) => !p.startsWith('@'))
+
+                if (argPartsDaring.length > 0) {
+                    tanggalInputDaring = argPartsDaring[0]
                 }
 
                 let tanggalFinalDaring = null
@@ -492,7 +525,12 @@ Reply gambar dengan:
 
 Atau dengan tanggal:
 
-#jurnal-daring 06-02-2026 7h matematika algoritma dasar`,
+#jurnal-daring 06-02-2026 7h matematika algoritma dasar
+
+Atau untuk guru lain (tag @guru):
+
+#jurnal-daring @628xxx 7h matematika algoritma dasar
+#jurnal-daring @628xxx 06-02-2026 7h matematika algoritma dasar`,
                     })
 
                     return true
@@ -515,7 +553,7 @@ Atau dengan tanggal:
                 })
 
                 try {
-                    await handleGroupImageMessage(wa, msg, sessionId, tanggalFinalDaring, 'daring', 'akademik')
+                    await handleGroupImageMessage(wa, msg, sessionId, tanggalFinalDaring, 'daring', 'akademik', customLidDaring)
                     success('CommandHandler', '#jurnal-daring command processed successfully', {
                         sessionId,
                     })
@@ -536,9 +574,23 @@ Atau dengan tanggal:
 
                 const partsEkstra = text.split(' ')
                 let tanggalInputEkstra = null
+                let customLidEkstra = null
 
-                if (partsEkstra.length > 1) {
-                    tanggalInputEkstra = partsEkstra[1]
+                // Extract custom LID from @mention
+                const mentionedJidEkstra = msg.message?.extendedTextMessage?.contextInfo?.mentionedJid
+                if (mentionedJidEkstra && mentionedJidEkstra.length > 0) {
+                    customLidEkstra = mentionedJidEkstra[0].replace(/@.*$/, '')
+                    info('CommandHandler', 'Custom LID from @mention (ekstra)', {
+                        sessionId,
+                        customLid: customLidEkstra,
+                    })
+                }
+
+                // Parse arguments after command, skipping @mention parts
+                const argPartsEkstra = partsEkstra.slice(1).filter((p) => !p.startsWith('@'))
+
+                if (argPartsEkstra.length > 0) {
+                    tanggalInputEkstra = argPartsEkstra[0]
                 }
 
                 let tanggalFinalEkstra = null
@@ -580,7 +632,12 @@ Reply gambar dengan:
 
 Atau dengan tanggal:
 
-#ekstra 06-02-2026 pramuka pengenalan tali temali`,
+#ekstra 06-02-2026 pramuka pengenalan tali temali
+
+Atau untuk guru lain (tag @guru):
+
+#ekstra @628xxx pramuka pengenalan tali temali
+#ekstra @628xxx 06-02-2026 pramuka pengenalan tali temali`,
                     })
 
                     return true
@@ -603,7 +660,7 @@ Atau dengan tanggal:
                 })
 
                 try {
-                    await handleGroupImageMessage(wa, msg, sessionId, tanggalFinalEkstra, 'luring', 'non_akademik')
+                    await handleGroupImageMessage(wa, msg, sessionId, tanggalFinalEkstra, 'luring', 'non_akademik', customLidEkstra)
                     success('CommandHandler', '#ekstra command processed successfully', {
                         sessionId,
                     })
@@ -640,15 +697,16 @@ Atau dengan tanggal:
 
 /**
  * Handle group image messages for journal entries
- * 
+ *
  * @param {import('baileys').AnyWASocket} wa - The WhatsApp session
  * @param {object} msg - The message object
  * @param {string} sessionId - The session ID
  * @param {string|null} tanggalCustom - Custom date in YYYY-MM-DD format
  * @param {string} metode - Metode pembelajaran: 'luring' (default) atau 'daring'
  * @param {string} jenis - Jenis jurnal: 'akademik' (default) atau 'non_akademik'
+ * @param {string|null} customLid - Custom LID (no_lid guru) from @mention, overrides default LID detection
  */
-const handleGroupImageMessage = async (wa, msg, sessionId, tanggalCustom = null, metode = 'luring', jenis = 'akademik') => {
+const handleGroupImageMessage = async (wa, msg, sessionId, tanggalCustom = null, metode = 'luring', jenis = 'akademik', customLid = null) => {
     try {
         console.log('==============================================')
         console.log('[JURNAL] Memulai proses input jurnal')
@@ -660,8 +718,12 @@ const handleGroupImageMessage = async (wa, msg, sessionId, tanggalCustom = null,
         let tanggalKirim = tanggalCustom
 
         // Get LID with better error handling
+        // Priority: customLid (from @mention) > quoted participant > sender
         try {
-            if (msg.message?.extendedTextMessage?.contextInfo?.participant) {
+            if (customLid) {
+                lid = customLid
+                console.log('[INFO] Mode CUSTOM LID - LID dari @mention:', lid)
+            } else if (msg.message?.extendedTextMessage?.contextInfo?.participant) {
                 const quotedParticipant = msg.message.extendedTextMessage.contextInfo.participant
                 lid = quotedParticipant.replace(/@.*$/, '')
                 console.log('[INFO] Mode QUOTE - LID dari quoted:', lid)
@@ -782,7 +844,8 @@ const handleGroupImageMessage = async (wa, msg, sessionId, tanggalCustom = null,
             return
         }
 
-        const parts = text.split(' ').filter((part) => part.trim() !== '')
+        // Filter out @mention parts from text parsing (they are LID references, not content)
+        const parts = text.split(' ').filter((part) => part.trim() !== '' && !part.startsWith('@'))
 
         // Mode COMMAND #JURNAL
         if (parts[0].toLowerCase() === '#jurnal') {
@@ -809,7 +872,11 @@ Gunakan:
 #jurnal 7h matematika algoritma dasar
 
 Atau dengan tanggal:
-#jurnal 06-02-2026 7h matematika algoritma dasar`,
+#jurnal 06-02-2026 7h matematika algoritma dasar
+
+Atau untuk guru lain (tag @guru):
+#jurnal @628xxx 7h matematika algoritma dasar
+#jurnal @628xxx 06-02-2026 7h matematika algoritma dasar`,
                     },
                     { quoted: msg },
                 )
@@ -841,7 +908,11 @@ Gunakan:
 #jurnal-daring 7h matematika algoritma dasar
 
 Atau dengan tanggal:
-#jurnal-daring 06-02-2026 7h matematika algoritma dasar`,
+#jurnal-daring 06-02-2026 7h matematika algoritma dasar
+
+Atau untuk guru lain (tag @guru):
+#jurnal-daring @628xxx 7h matematika algoritma dasar
+#jurnal-daring @628xxx 06-02-2026 7h matematika algoritma dasar`,
                     },
                     { quoted: msg },
                 )
@@ -873,7 +944,11 @@ Gunakan:
 #ekstra pramuka pengenalan tali temali
 
 Atau dengan tanggal:
-#ekstra 06-02-2026 pramuka pengenalan tali temali`,
+#ekstra 06-02-2026 pramuka pengenalan tali temali
+
+Atau untuk guru lain (tag @guru):
+#ekstra @628xxx pramuka pengenalan tali temali
+#ekstra @628xxx 06-02-2026 pramuka pengenalan tali temali`,
                     },
                     { quoted: msg },
                 )
@@ -921,7 +996,12 @@ daring 7h matematika algoritma dasar
 📌 Tanggal custom:
 #jurnal 06-02-2026 7h matematika algoritma dasar
 #jurnal-daring 06-02-2026 7h matematika algoritma dasar
-#ekstra 06-02-2026 pramuka pengenalan tali temali`,
+#ekstra 06-02-2026 pramuka pengenalan tali temali
+
+📌 Untuk guru lain (tag @guru):
+#jurnal @628xxx 7h matematika algoritma dasar
+#jurnal-daring @628xxx 7h matematika algoritma dasar
+#ekstra @628xxx pramuka pengenalan tali temali`,
                 },
                 { quoted: msg },
             )
@@ -1056,21 +1136,25 @@ const handleMenuCommand = async (wa, msg) => {
             `📝 *#jurnal* - Input jurnal luring/akademik dengan gambar\n` +
             `   Format: #jurnal [tanggal] kelas materi\n` +
             `   Contoh: #jurnal 7h matematika algoritma dasar\n` +
-            `   Contoh: #jurnal 06-02-2026 7h matematika algoritma dasar\n\n` +
+            `   Contoh: #jurnal 06-02-2026 7h matematika algoritma dasar\n` +
+            `   Untuk guru lain: #jurnal @628xxx 7h matematika algoritma dasar\n\n` +
             `💻 *#jurnal-daring* - Input jurnal daring/akademik dengan gambar\n` +
             `   Format: #jurnal-daring [tanggal] kelas materi\n` +
             `   Contoh: #jurnal-daring 7h matematika algoritma dasar\n` +
-            `   Contoh: #jurnal-daring 06-02-2026 7h matematika algoritma dasar\n\n` +
+            `   Contoh: #jurnal-daring 06-02-2026 7h matematika algoritma dasar\n` +
+            `   Untuk guru lain: #jurnal-daring @628xxx 7h matematika algoritma dasar\n\n` +
             `🏅 *#ekstra* - Input jurnal luring/non-akademik (ekstrakurikuler) dengan gambar\n` +
             `   Format: #ekstra [tanggal] materi\n` +
             `   Contoh: #ekstra pramuka pengenalan tali temali\n` +
-            `   Contoh: #ekstra 06-02-2026 pramuka pengenalan tali temali\n\n` +
+            `   Contoh: #ekstra 06-02-2026 pramuka pengenalan tali temali\n` +
+            `   Untuk guru lain: #ekstra @628xxx pramuka pengenalan tali temali\n\n` +
             `📌 *Caption langsung pada gambar:*\n` +
             `   Luring/Akademik: 7h matematika algoritma dasar\n` +
             `   Daring/Akademik: daring 7h matematika algoritma dasar\n\n` +
             ` *Catatan:*\n` +
             `   - Gunakan format tanggal DD-MM-YYYY untuk tanggal custom\n` +
             `   - Reply gambar untuk input jurnal\n` +
+            `   - Tag @guru untuk input jurnal atas nama guru lain\n` +
             `   - Nama bulan: januari, februari, maret, dst.\n` +
             `   - Untuk billing, tahun default adalah tahun berjalan\n\n` +
             `⚠️ *Akses Terbatas*\n` +
