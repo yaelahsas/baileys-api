@@ -1035,7 +1035,13 @@ daring 7h matematika algoritma dasar
         }
 
         console.log('[INFO] Mengirim data ke API dengan retry logic...')
-
+        // React processing
+        await wa.sendMessage(msg.key.remoteJid, {
+            react: {
+                text: '⏳',
+                key: msg.key,
+            },
+        })
         try {
             const response = await retryApiCall(
                 () =>
@@ -1063,9 +1069,22 @@ daring 7h matematika algoritma dasar
                     `📋 Jenis  : ${jenis === 'non_akademik' ? 'Non-Akademik' : 'Akademik'}`
 
                 await wa.sendMessage(msg.key.remoteJid, { text: successMessage }, { quoted: msg })
-
+                // React sukses
+                await wa.sendMessage(msg.key.remoteJid, {
+                    react: {
+                        text: '✅',
+                        key: msg.key,
+                    },
+                })
                 console.log('[SUCCESS] Jurnal berhasil disimpan')
             } else {
+                // React gagal
+                await wa.sendMessage(msg.key.remoteJid, {
+                    react: {
+                        text: '❌',
+                        key: msg.key,
+                    },
+                })
                 console.log('[ERROR] Response API gagal:', response.data)
 
                 await wa.sendMessage(
@@ -1163,9 +1182,22 @@ const handleMenuCommand = async (wa, msg) => {
         await wa.sendMessage(msg.key.remoteJid, {
             text: menuMessage,
         }, { quoted: msg })
-
+     // React sukses
+                await wa.sendMessage(msg.key.remoteJid, {
+                    react: {
+                        text: '✅',
+                        key: msg.key,
+                    },
+                })
         console.log('[SUCCESS] Menu berhasil ditampilkan')
     } catch (error) {
+             // React gagal
+                await wa.sendMessage(msg.key.remoteJid, {
+                    react: {
+                        text: '❌',
+                        key: msg.key,
+                    },
+                })
         console.error('[ERROR] Gagal menampilkan menu:', error)
         await wa.sendMessage(msg.key.remoteJid, {
             text: '❌ Terjadi kesalahan saat menampilkan menu.',
@@ -1286,6 +1318,13 @@ const handleReportCommand = async (wa, msg) => {
                 },
                 { quoted: msg },
             )
+                 // React sukses
+                await wa.sendMessage(msg.key.remoteJid, {
+                    react: {
+                        text: '✅',
+                        key: msg.key,
+                    },
+                })
 
             console.log('==============================================')
             console.log('[SUCCESS] Laporan berhasil terkirim!')
@@ -1303,6 +1342,13 @@ const handleReportCommand = async (wa, msg) => {
                 { text: '❌ Maaf, terjadi kesalahan saat mengambil laporan.' },
                 { quoted: msg },
             )
+                 // React gagal
+                await wa.sendMessage(msg.key.remoteJid, {
+                    react: {
+                        text: '❌',
+                        key: msg.key,
+                    },
+                })
         }
     } catch (error) {
         console.log('==============================================')
@@ -1456,7 +1502,13 @@ const handleBillingCommand = async (wa, msg) => {
                 },
                 { quoted: msg },
             )
-
+     // React sukses
+                await wa.sendMessage(msg.key.remoteJid, {
+                    react: {
+                        text: '✅',
+                        key: msg.key,
+                    },
+                })
             console.log('==============================================')
             console.log('[SUCCESS] Billing berhasil terkirim!')
             console.log('[INFO] File   :', filename)
@@ -1473,6 +1525,13 @@ const handleBillingCommand = async (wa, msg) => {
                 { text: '❌ Maaf, terjadi kesalahan saat mengambil laporan billing.' },
                 { quoted: msg },
             )
+                 // React gagal
+                await wa.sendMessage(msg.key.remoteJid, {
+                    react: {
+                        text: '❌',
+                        key: msg.key,
+                    },
+                })
         }
     } catch (error) {
         console.log('==============================================')
@@ -1562,7 +1621,13 @@ const handleTodayCommand = async (wa, msg) => {
                     `💡 Gunakan #jurnal untuk menginput jurnal.`
 
                 await wa.sendMessage(msg.key.remoteJid, { text: noDataMessage }, { quoted: msg })
-
+     // React sukses
+                await wa.sendMessage(msg.key.remoteJid, {
+                    react: {
+                        text: '✅',
+                        key: msg.key,
+                    },
+                })
                 console.log('[SUCCESS] Pesan "belum ada jurnal" berhasil dikirim')
             } else {
                 // Format the journal list
@@ -1586,6 +1651,14 @@ const handleTodayCommand = async (wa, msg) => {
 
                 await wa.sendMessage(msg.key.remoteJid, { text: jurnalList }, { quoted: msg })
 
+                // React sukses
+                await wa.sendMessage(msg.key.remoteJid, {
+                    react: {
+                        text: '✅',
+                        key: msg.key,
+                    },
+                })
+
                 console.log('[SUCCESS] Daftar jurnal hari ini berhasil dikirim')
             }
         } else {
@@ -1599,6 +1672,13 @@ const handleTodayCommand = async (wa, msg) => {
                 { text: '❌ Maaf, terjadi kesalahan saat mengambil data jurnal hari ini.' },
                 { quoted: msg },
             )
+                 // React gagal
+                await wa.sendMessage(msg.key.remoteJid, {
+                    react: {
+                        text: '❌',
+                        key: msg.key,
+                    },
+                })
         }
     } catch (error) {
         console.log('==============================================')
@@ -1626,6 +1706,13 @@ const handleTodayCommand = async (wa, msg) => {
                 { text: '❌ Maaf, terjadi kesalahan saat memproses permintaan jurnal hari ini.' },
                 { quoted: msg },
             )
+                 // React gagal
+                await wa.sendMessage(msg.key.remoteJid, {
+                    react: {
+                        text: '❌',
+                        key: msg.key,
+                    },
+                })
         } catch (sendErr) {
             console.log('[ERROR] Gagal mengirim pesan error ke WhatsApp:', sendErr.message)
         }
