@@ -20,7 +20,8 @@ import {
 import response from './../response.js'
 
 const getList = (req, res) => {
-    return response(res, 200, true, '', getChatList(res.locals.sessionId, true))
+    const session = getSession(res.locals.sessionId)
+    return response(res, 200, true, '', getChatList(session, true))
 }
 
 const getListWithoutParticipants = async (req, res) => {
@@ -66,13 +67,13 @@ const send = async (req, res) => {
     const session = getSession(res.locals.sessionId)
 
     try {
-        const receiver = formatGroup(req.body.receiver)
+        const receiver = formatGroup(req.params.jid)
         const { message } = req.body
 
         const exists = await isExists(session, receiver, true)
 
         if (!exists) {
-            return response(res, 400, false, 'The receiver number is not exists.')
+            return response(res, 400, false, 'The group is not exists.')
         }
 
         await sendMessage(session, receiver, message, {}, 0)
@@ -96,10 +97,10 @@ const groupParticipantsUpdate = async (req, res) => {
             return response(res, 400, false, 'The group is not exists.')
         }
 
-        await participantsUpdate(session, formatGroup(jid), participantsFormat, action)
+        await participantsUpdate(session, jid, participantsFormat, action)
         response(res, 200, true, 'Update participants successfully.')
     } catch {
-        response(res, 500, false, 'Failed update participants.')
+        response(res, 500, false, 'Failed to update participants.')
     }
 }
 
@@ -114,11 +115,11 @@ const groupUpdateSubject = async (req, res) => {
             return response(res, 400, false, 'The group is not exists.')
         }
 
-        await updateSubject(session, formatGroup(jid), subject)
+        await updateSubject(session, jid, subject)
 
         response(res, 200, true, 'Update subject successfully.')
     } catch {
-        response(res, 500, false, 'Failed update subject.')
+        response(res, 500, false, 'Failed to update subject.')
     }
 }
 
@@ -133,11 +134,11 @@ const groupUpdateDescription = async (req, res) => {
             return response(res, 400, false, 'The group is not exists.')
         }
 
-        await updateDescription(session, formatGroup(jid), description)
+        await updateDescription(session, jid, description)
 
         response(res, 200, true, 'Update description successfully.')
     } catch {
-        response(res, 500, false, 'Failed description subject.')
+        response(res, 500, false, 'Failed to update description.')
     }
 }
 
@@ -157,7 +158,7 @@ const groupSettingUpdate = async (req, res) => {
 
         response(res, 200, true, 'Update setting successfully.')
     } catch {
-        response(res, 500, false, 'Failed update setting.')
+        response(res, 500, false, 'Failed to update setting.')
     }
 }
 
@@ -175,7 +176,7 @@ const groupLeave = async (req, res) => {
 
         response(res, 200, true, 'Leave group successfully.')
     } catch {
-        response(res, 500, false, 'Failed leave group.')
+        response(res, 500, false, 'Failed to leave group.')
     }
 }
 
@@ -193,7 +194,7 @@ const groupInviteCode = async (req, res) => {
 
         response(res, 200, true, 'Invite code successfully.', group)
     } catch {
-        response(res, 500, false, 'Failed invite code.')
+        response(res, 500, false, 'Failed to get invite code.')
     }
 }
 
@@ -204,7 +205,7 @@ const groupAcceptInvite = async (req, res) => {
 
         response(res, 200, true, 'Accept invite successfully.', group)
     } catch {
-        response(res, 500, false, 'Failed accept invite.')
+        response(res, 500, false, 'Failed to accept invite.')
     }
 }
 
@@ -223,7 +224,7 @@ const groupRevokeInvite = async (req, res) => {
 
         response(res, 200, true, 'Revoke code successfully.', group)
     } catch {
-        response(res, 500, false, 'Failed rovoke code.')
+        response(res, 500, false, 'Failed to revoke code.')
     }
 }
 
@@ -241,7 +242,7 @@ const updateProfilePicture = async (req, res) => {
         await profilePicture(session, jid, url)
         response(res, 200, true, 'Update profile picture successfully.')
     } catch {
-        response(res, 500, false, 'Failed Update profile picture.')
+        response(res, 500, false, 'Failed to update profile picture.')
     }
 }
 

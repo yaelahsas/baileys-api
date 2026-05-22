@@ -23,12 +23,18 @@ import {
     debug,
     separator,
 } from '../utils/logger.js'
+import fs from 'fs'
+import { generateVoiceNote } from '../utils/tts.js'
 
 /**
  * Authorized phone numbers for command access
+ * Can be configured via AUTHORIZED_NUMBERS env variable (comma-separated)
+ * Falls back to hardcoded defaults if not set
  * @type {Array<string>}
  */
-const AUTHORIZED_NUMBERS = ['6285212870484', '6283853399847']
+const AUTHORIZED_NUMBERS = process.env.AUTHORIZED_NUMBERS
+    ? process.env.AUTHORIZED_NUMBERS.split(',').map(n => n.trim())
+    : ['6285212870484', '6283853399847']
 
 /**
  * Known commands that the bot recognizes
@@ -192,13 +198,39 @@ const sanitizeText = (text) => {
 }
 
 /**
+ * Extract phone number from a JID (WhatsApp ID)
+ * Properly handles both user JIDs (xxx@s.whatsapp.net) and group JIDs (xxx@g.us)
+ * For group JIDs, returns the raw numeric part (which is the group ID, not a phone number)
+ * 
+ * @param {string} jid - The JID string to extract from
+ * @returns {string} The extracted number portion
+ */
+const extractPhoneNumber = (jid) => {
+    if (!jid) return ''
+    // Split at @ and take the first part (the number)
+    // s.whatsapp.net = personal number, g.us = group ID, lid = linked ID
+    return jid.split('@')[0]
+}
+
+/**
+ * Check if a JID is a personal WhatsApp number (not a group)
+ * 
+ * @param {string} jid - The JID to check
+ * @returns {boolean} True if it's a personal number JID
+ */
+const isPersonalJid = (jid) => {
+    if (!jid) return false
+    return jid.endsWith('@s.whatsapp.net') || jid.endsWith('@lid')
+}
+
+/**
  * Check if a user is authorized to use commands
  * 
  * @param {string} sender - The sender's JID
  * @returns {boolean} True if authorized, false otherwise
  */
 const isAuthorized = (sender) => {
-    const phoneNumber = sender.replace(/[@s.whatsapp.net@g.us]/g, '')
+    const phoneNumber = extractPhoneNumber(sender)
     return AUTHORIZED_NUMBERS.includes(phoneNumber)
 }
 
@@ -217,7 +249,11 @@ const handleGroupCommands = async (wa, msg, sessionId) => {
             groupId: msg.key.remoteJid,
         })
 
-        const messageContent = msg.message.conversation || msg.message.extendedTextMessage?.text || ''
+        // Extract text from all possible message types:
+        // - conversation: plain text messages
+        // - extendedTextMessage: text with links/mentions/quotes
+        // - imageMessage.caption: images with caption (like "#jurnal 8K matematika" sent with a photo)
+        const messageContent = msg.message.conversation || msg.message.extendedTextMessage?.text || msg.message.imageMessage?.caption || ''
 
         if (!messageContent) {
             debug('CommandHandler', 'Empty message, skipping command handler', {
@@ -243,9 +279,9 @@ const handleGroupCommands = async (wa, msg, sessionId) => {
             return false
         }
 
-        // Authorization check
-        const sender = msg.key.participantAlt || msg.key.remoteJid
-        const phoneNumber = sender.replace(/[@s.whatsapp.net@g.us]/g, '')
+        // Authorization check - use participant (actual sender) not remoteJid (group ID)
+        const sender = msg.key.participant || msg.key.participantAlt || msg.key.remoteJid
+        const phoneNumber = extractPhoneNumber(sender)
 
         debug('CommandHandler', 'Authorization check', {
             sessionId,
@@ -363,9 +399,11 @@ const handleGroupCommands = async (wa, msg, sessionId) => {
                 let customLid = null
 
                 // Extract custom LID from @mention
-                const mentionedJid = msg.message?.extendedTextMessage?.contextInfo?.mentionedJid
+               const mentionedJid =
+    msg.message?.extendedTextMessage?.contextInfo?.mentionedJid ||
+    msg.message?.imageMessage?.contextInfo?.mentionedJid
                 if (mentionedJid && mentionedJid.length > 0) {
-                    customLid = mentionedJid[0].replace(/@.*$/, '')
+                    customLid = extractPhoneNumber(mentionedJid[0])
                     info('CommandHandler', 'Custom LID from @mention', {
                         sessionId,
                         customLid,
@@ -472,7 +510,7 @@ Atau untuk guru lain (tag @guru):
                 // Extract custom LID from @mention
                 const mentionedJidDaring = msg.message?.extendedTextMessage?.contextInfo?.mentionedJid
                 if (mentionedJidDaring && mentionedJidDaring.length > 0) {
-                    customLidDaring = mentionedJidDaring[0].replace(/@.*$/, '')
+                    customLidDaring = extractPhoneNumber(mentionedJidDaring[0])
                     info('CommandHandler', 'Custom LID from @mention (daring)', {
                         sessionId,
                         customLid: customLidDaring,
@@ -579,7 +617,7 @@ Atau untuk guru lain (tag @guru):
                 // Extract custom LID from @mention
                 const mentionedJidEkstra = msg.message?.extendedTextMessage?.contextInfo?.mentionedJid
                 if (mentionedJidEkstra && mentionedJidEkstra.length > 0) {
-                    customLidEkstra = mentionedJidEkstra[0].replace(/@.*$/, '')
+                    customLidEkstra = extractPhoneNumber(mentionedJidEkstra[0])
                     info('CommandHandler', 'Custom LID from @mention (ekstra)', {
                         sessionId,
                         customLid: customLidEkstra,
@@ -718,29 +756,53 @@ const handleGroupImageMessage = async (wa, msg, sessionId, tanggalCustom = null,
         let tanggalKirim = tanggalCustom
 
         // Get LID with better error handling
-        // Priority: customLid (from @mention) > quoted participant > sender
+        // Priority: customLid (from @mention) > quoted participant > sender participant
+        // IMPORTANT: In groups, msg.key.remoteJid is the GROUP ID, NOT the sender's phone number
+        // We must use msg.key.participant (the sender's actual JID in the group) or quoted participant
         try {
             if (customLid) {
                 lid = customLid
                 console.log('[INFO] Mode CUSTOM LID - LID dari @mention:', lid)
             } else if (msg.message?.extendedTextMessage?.contextInfo?.participant) {
                 const quotedParticipant = msg.message.extendedTextMessage.contextInfo.participant
-                lid = quotedParticipant.replace(/@.*$/, '')
-                console.log('[INFO] Mode QUOTE - LID dari quoted:', lid)
+                lid = extractPhoneNumber(quotedParticipant)
+                console.log('[INFO] Mode QUOTE - LID dari quoted participant:', lid)
+            } else if (msg.key.participant) {
+                // msg.key.participant is the actual sender's JID in a group
+                // This is the correct field to use for sender identification in groups
+                lid = extractPhoneNumber(msg.key.participant)
+                console.log('[INFO] Mode PARTICIPANT - LID dari msg.key.participant:', lid)
+            } else if (msg.key.participantAlt) {
+                // participantAlt may contain the linked device ID
+                lid = extractPhoneNumber(msg.key.participantAlt)
+                console.log('[INFO] Mode PARTICIPANT_ALT - LID dari msg.key.participantAlt:', lid)
+            } else if (isPersonalJid(msg.key.remoteJid)) {
+                // Only use remoteJid if it's a personal chat (not a group)
+                lid = extractPhoneNumber(msg.key.remoteJid)
+                console.log('[INFO] Mode PERSONAL CHAT - LID dari remoteJid:', lid)
             } else {
-                const participant = msg.key.participant || msg.key.remoteJid
-                lid =  participant.replace(/@.*$/, '')
-                console.log('[INFO] Mode NORMAL - LID dari pengirim:', lid)
+                // If we're in a group and no participant info is available,
+                // this is a Baileys data issue - we cannot reliably determine the sender
+                console.error('[ERROR] Cannot determine sender in group - no participant info available')
+                throw new Error('Tidak dapat mengidentifikasi pengirim dalam grup')
             }
 
             if (!lid) {
                 throw new Error('Tidak dapat mengidentifikasi pengirim')
             }
+
+            // Validate that lid looks like a phone number (digits only, reasonable length)
+            const lidClean = lid.replace(/\D/g, '')
+            if (lidClean.length < 8 || lidClean.length > 15) {
+                console.warn('[WARN] LID does not look like a valid phone number:', lid, '(length:', lidClean.length, ')')
+                // Don't throw here - some systems use different ID formats
+                // But log a warning for debugging
+            }
         } catch (error) {
             console.error('[ERROR] Gagal mendapatkan LID:', error)
             await wa.sendMessage(
                 msg.key.remoteJid,
-                { text: '❌ Gagal mengidentifikasi pengirim. Silakan coba lagi.' },
+                { text: '❌ Gagal mengidentifikasi pengirim. Silakan coba lagi atau tag @nomor Anda.' },
                 { quoted: msg },
             )
             return
@@ -1182,6 +1244,22 @@ const handleMenuCommand = async (wa, msg) => {
         await wa.sendMessage(msg.key.remoteJid, {
             text: menuMessage,
         }, { quoted: msg })
+
+        const voice = await generateVoiceNote(
+    `Berikut menu yang ada didalam bot`
+)
+
+await wa.sendMessage(
+    msg.key.remoteJid,
+    {
+        audio: fs.readFileSync(voice.oggPath),
+        mimetype: 'audio/ogg; codecs=opus',
+        ptt: true,
+    },
+    { quoted: msg }
+)
+fs.unlinkSync(voice.mp3Path)
+fs.unlinkSync(voice.oggPath)
      // React sukses
                 await wa.sendMessage(msg.key.remoteJid, {
                     react: {
@@ -1254,12 +1332,10 @@ const handleReportCommand = async (wa, msg) => {
             let no_lid = ''
 
             if (msg.message?.extendedTextMessage?.contextInfo?.mentionedJid?.length > 0) {
-                no_lid = msg.message.extendedTextMessage.contextInfo.mentionedJid[0]
+                no_lid = extractPhoneNumber(msg.message.extendedTextMessage.contextInfo.mentionedJid[0])
             } else if (commandParts[2]) {
-                no_lid = commandParts[2]
+                no_lid = commandParts[2].replace(/[@a-z.]/gi, '')
             }
-
-            no_lid = no_lid.replace(/[@a-z.]/gi, '')
 
             if (!no_lid) {
                 await wa.sendMessage(

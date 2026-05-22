@@ -7,6 +7,9 @@ import getMessages from './../controllers/getMessages.js'
 
 const router = Router()
 
+// IMPORTANT: Specific routes MUST be defined BEFORE the catch-all /:jid route
+// Express matches routes in order, so /:jid would intercept all specific routes if placed first
+
 router.get('/', query('id').notEmpty(), requestValidator, sessionValidator, controller.getList)
 
 router.post(
@@ -22,14 +25,11 @@ router.post(
 router.post(
     '/send/:jid',
     query('id').notEmpty(),
-    body('receiver').notEmpty(),
     body('message').notEmpty(),
     requestValidator,
     sessionValidator,
     controller.send
 )
-
-router.get('/:jid', query('id').notEmpty(), requestValidator, sessionValidator, getMessages)
 
 router.get('/meta/:jid', query('id').notEmpty(), requestValidator, sessionValidator, controller.getGroupMetaData)
 
@@ -74,6 +74,8 @@ router.post('/leave/:jid', query('id').notEmpty(), requestValidator, sessionVali
 
 router.get('/invite-code/:jid', query('id').notEmpty(), requestValidator, sessionValidator, controller.groupInviteCode)
 
+router.post('/revoke-code/:jid', query('id').notEmpty(), requestValidator, sessionValidator, controller.groupRevokeInvite)
+
 router.post(
     '/accept-invite',
     query('id').notEmpty(),
@@ -81,14 +83,6 @@ router.post(
     requestValidator,
     sessionValidator,
     controller.groupAcceptInvite
-)
-
-router.post(
-    '/revoke-code/:jid',
-    query('id').notEmpty(),
-    requestValidator,
-    sessionValidator,
-    controller.groupRevokeInvite
 )
 
 router.post(
@@ -107,5 +101,9 @@ router.post(
     sessionValidator,
     controller.getListWithoutParticipants
 )
+
+// Catch-all route for group conversation messages - MUST be last!
+// This route matches /groups/:jid where :jid is the group JID (e.g., 123456789@g.us)
+router.get('/:jid', query('id').notEmpty(), requestValidator, sessionValidator, getMessages)
 
 export default router

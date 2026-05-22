@@ -2,6 +2,7 @@ import 'dotenv/config'
 import express from 'express'
 import nodeCleanup from 'node-cleanup'
 import routes from './routes.js'
+import healthRoute from './routes/healthRoute.js'
 import { init, cleanup } from './whatsapp.js'
 import cors from 'cors'
 import {
@@ -19,6 +20,8 @@ const port = parseInt(process.env.PORT ?? 8000)
 app.use(cors())
 app.use(express.urlencoded({ extended: true }))
 app.use(express.json())
+// Health endpoint - no auth required (for Docker healthcheck)
+app.use('/health', healthRoute)
 app.use('/', routes)
 
 const listenerCallback = () => {

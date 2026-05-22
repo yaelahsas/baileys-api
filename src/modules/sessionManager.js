@@ -61,10 +61,26 @@ const keepAliveTimers = new Map()
 const connectionMonitorTimers = new Map()
 
 /**
+ * Track consecutive failed keep-alive pings per session
+ * Used to detect silent connection death (zombie connections)
+ * @type {Map<string, number>}
+ */
+const failedPingCounters = new Map()
+
+/**
+ * Track last successful keep-alive timestamp per session
+ * Used to detect how long since last successful server response
+ * @type {Map<string, number>}
+ */
+const lastSuccessfulPing = new Map()
+
+/**
  * Keep-alive configuration from environment
  */
 const KEEP_ALIVE_INTERVAL = parseInt(process.env.KEEP_ALIVE_INTERVAL ?? 25000) // 25 seconds default
 const CONNECTION_CHECK_INTERVAL = parseInt(process.env.CONNECTION_CHECK_INTERVAL ?? 60000) // 60 seconds default
+const MAX_FAILED_PINGS = parseInt(process.env.MAX_FAILED_PINGS ?? 3) // Force reconnect after 3 consecutive failures
+const STALE_CONNECTION_TIMEOUT = parseInt(process.env.STALE_CONNECTION_TIMEOUT ?? 300000) // 5 minutes - no successful ping = stale
 
 /**
  * Message retry counter cache
@@ -172,11 +188,78 @@ const stopKeepAlive = (sessionId) => {
         connectionMonitorTimers.delete(sessionId)
         debug('SessionManager', 'Connection monitor timer stopped', { sessionId })
     }
+
+    // Clean up ping tracking data
+    failedPingCounters.delete(sessionId)
+    lastSuccessfulPing.delete(sessionId)
+}
+
+/**
+ * Force reconnect a session that has become stale (zombie connection)
+ * This is called when keep-alive pings fail consecutively or connection is stale
+ * 
+ * @param {string} sessionId - The session ID
+ * @param {string} reason - The reason for forcing reconnect
+ */
+const forceReconnect = (sessionId, reason) => {
+    warning('SessionManager', 'Force reconnecting stale session', {
+        sessionId,
+        reason,
+    })
+
+    const session = sessions.get(sessionId)
+    if (!session) {
+        error('SessionManager', 'Cannot force reconnect - session not found', {
+            sessionId,
+        })
+        return
+    }
+
+    // Stop keep-alive timers first
+    stopKeepAlive(sessionId)
+
+    // Remove session from active sessions map
+    sessions.delete(sessionId)
+
+    // Attempt to close the socket gracefully
+    try {
+        if (session.ws?.socket) {
+            session.ws.socket.close()
+        }
+    } catch (e) {
+        debug('SessionManager', 'Error closing socket during force reconnect', {
+            sessionId,
+            error: e.message,
+        })
+    }
+
+    // Schedule reconnection with a short delay
+    const reconnectDelay = 2000 // 2 seconds
+    info('SessionManager', 'Scheduling forced reconnection', {
+        sessionId,
+        delay: reconnectDelay,
+        reason,
+    })
+
+    setTimeout(() => {
+        // Get stored options for reconnection
+        const existingCallbacks = sessionCallbacks.get(sessionId)
+        createSession(
+            sessionId,
+            null,
+            {},
+            existingCallbacks?.onMessageUpsert || null,
+            existingCallbacks?.onConnectionUpdate || null,
+            existingCallbacks?.onWebhook || null,
+            true // isReconnect
+        )
+    }, reconnectDelay)
 }
 
 /**
  * Start keep-alive mechanism for a session
- * Sends periodic ping/keep-alive requests to prevent the connection from being closed due to inactivity
+ * Sends periodic ping/keep-alive requests to prevent the connection from being closed due to inactivity.
+ * Tracks consecutive ping failures and forces reconnection when threshold is reached.
  * 
  * @param {string} sessionId - The session ID
  * @param {import('baileys').AnyWASocket} wa - The WhatsApp socket instance
@@ -185,40 +268,103 @@ const startKeepAlive = (sessionId, wa) => {
     // Stop any existing timers first
     stopKeepAlive(sessionId)
 
+    // Initialize ping tracking
+    failedPingCounters.set(sessionId, 0)
+    lastSuccessfulPing.set(sessionId, Date.now())
+
     // Keep-alive: periodically check connection and send presence update
+    // Track success/failure to detect silent connection death
     const keepAliveTimer = setInterval(() => {
         try {
-            const isConnected = wa.ws?.socket?.readyState === 1
-            if (isConnected) {
-                debug('SessionManager', 'Keep-alive ping', {
-                    sessionId,
-                    readyState: wa.ws?.socket?.readyState,
-                })
-                // Send presence update as keep-alive ping
-                wa.sendPresenceUpdate('available')
-                    .catch((err) => {
-                        warning('SessionManager', 'Keep-alive presence update failed', {
-                            sessionId,
-                            error: err.message,
-                        })
-                    })
-            } else {
+            const currentSession = sessions.get(sessionId)
+            if (!currentSession) {
+                debug('SessionManager', 'Session no longer exists, stopping keep-alive', { sessionId })
+                stopKeepAlive(sessionId)
+                return
+            }
+
+            const isConnected = currentSession.ws?.socket?.readyState === 1
+            if (!isConnected) {
                 warning('SessionManager', 'Keep-alive detected disconnected socket', {
                     sessionId,
-                    readyState: wa.ws?.socket?.readyState,
+                    readyState: currentSession.ws?.socket?.readyState,
                 })
+                // Increment failed ping counter
+                const failedPings = (failedPingCounters.get(sessionId) || 0) + 1
+                failedPingCounters.set(sessionId, failedPings)
+
+                if (failedPings >= MAX_FAILED_PINGS) {
+                    error('SessionManager', `Max failed pings (${MAX_FAILED_PINGS}) reached, forcing reconnect`, {
+                        sessionId,
+                        failedPings,
+                    })
+                    clearInterval(keepAliveTimer)
+                    keepAliveTimers.delete(sessionId)
+                    forceReconnect(sessionId, `keep-alive-failed-${failedPings}-pings`)
+                }
+                return
             }
+
+            debug('SessionManager', 'Keep-alive ping', {
+                sessionId,
+                readyState: currentSession.ws?.socket?.readyState,
+                failedPings: failedPingCounters.get(sessionId) || 0,
+            })
+
+            // Send presence update as keep-alive ping with response verification
+            currentSession.sendPresenceUpdate('available')
+                .then(() => {
+                    // Successful ping - reset counter
+                    failedPingCounters.set(sessionId, 0)
+                    lastSuccessfulPing.set(sessionId, Date.now())
+                    debug('SessionManager', 'Keep-alive ping successful', {
+                        sessionId,
+                    })
+                })
+                .catch((err) => {
+                    warning('SessionManager', 'Keep-alive presence update failed', {
+                        sessionId,
+                        error: err.message,
+                    })
+                    // Increment failed ping counter
+                    const failedPings = (failedPingCounters.get(sessionId) || 0) + 1
+                    failedPingCounters.set(sessionId, failedPings)
+
+                    if (failedPings >= MAX_FAILED_PINGS) {
+                        error('SessionManager', `Max failed pings (${MAX_FAILED_PINGS}) reached, forcing reconnect`, {
+                            sessionId,
+                            failedPings,
+                        })
+                        clearInterval(keepAliveTimer)
+                        keepAliveTimers.delete(sessionId)
+                        forceReconnect(sessionId, `keep-alive-failed-${failedPings}-pings`)
+                    }
+                })
         } catch (err) {
             warning('SessionManager', 'Keep-alive check error', {
                 sessionId,
                 error: err.message,
             })
+            // Increment failed ping counter for errors too
+            const failedPings = (failedPingCounters.get(sessionId) || 0) + 1
+            failedPingCounters.set(sessionId, failedPings)
+
+            if (failedPings >= MAX_FAILED_PINGS) {
+                error('SessionManager', `Max failed pings (${MAX_FAILED_PINGS}) reached after error, forcing reconnect`, {
+                    sessionId,
+                    failedPings,
+                })
+                clearInterval(keepAliveTimer)
+                keepAliveTimers.delete(sessionId)
+                forceReconnect(sessionId, `keep-alive-error-${failedPings}-pings`)
+            }
         }
     }, KEEP_ALIVE_INTERVAL)
 
     keepAliveTimers.set(sessionId, keepAliveTimer)
 
     // Connection monitor: periodically check if the connection is still alive
+    // Uses lastSuccessfulPing to detect stale connections that appear connected but are dead
     const monitorTimer = setInterval(() => {
         try {
             const session = sessions.get(sessionId)
@@ -229,32 +375,36 @@ const startKeepAlive = (sessionId, wa) => {
             }
 
             const isConnected = session.ws?.socket?.readyState === 1
+            const lastPing = lastSuccessfulPing.get(sessionId) || 0
+            const timeSinceLastPing = Date.now() - lastPing
+            const failedPings = failedPingCounters.get(sessionId) || 0
+
             if (!isConnected) {
-                warning('SessionManager', 'Connection monitor detected dead connection', {
+                warning('SessionManager', 'Connection monitor detected disconnected socket', {
                     sessionId,
                     readyState: session.ws?.socket?.readyState,
+                    failedPings,
                 })
-                // The connection.update handler should handle reconnection,
-                // but if it doesn't fire, we force a reconnection attempt
-                // by checking if the session is in a stale state
-                const lastDisconnect = session.ws?.socket?._lastDisconnect
-                if (!lastDisconnect) {
-                    info('SessionManager', 'Attempting to force reconnect stale session', {
-                        sessionId,
-                    })
-                    // Close the socket to trigger connection.update with 'close' status
-                    try {
-                        session.ws?.socket?.close()
-                    } catch (e) {
-                        debug('SessionManager', 'Error closing stale socket', {
-                            sessionId,
-                            error: e.message,
-                        })
-                    }
+                // Connection update handler should handle reconnection
+                // But if it doesn't fire, force reconnect
+                if (failedPings >= MAX_FAILED_PINGS) {
+                    forceReconnect(sessionId, 'monitor-detected-disconnected')
                 }
+            } else if (timeSinceLastPing > STALE_CONNECTION_TIMEOUT) {
+                // Socket appears connected but no successful ping in a long time
+                // This is the "zombie connection" scenario
+                error('SessionManager', 'Connection appears connected but is stale (no successful ping)', {
+                    sessionId,
+                    timeSinceLastPing: `${Math.round(timeSinceLastPing / 1000)}s`,
+                    staleTimeout: `${STALE_CONNECTION_TIMEOUT / 1000}s`,
+                    failedPings,
+                })
+                forceReconnect(sessionId, `stale-connection-${Math.round(timeSinceLastPing / 1000)}s`)
             } else {
                 debug('SessionManager', 'Connection monitor: session is healthy', {
                     sessionId,
+                    timeSinceLastPing: `${Math.round(timeSinceLastPing / 1000)}s`,
+                    failedPings,
                 })
             }
         } catch (err) {
@@ -271,6 +421,8 @@ const startKeepAlive = (sessionId, wa) => {
         sessionId,
         keepAliveInterval: KEEP_ALIVE_INTERVAL,
         connectionCheckInterval: CONNECTION_CHECK_INTERVAL,
+        maxFailedPings: MAX_FAILED_PINGS,
+        staleConnectionTimeout: `${STALE_CONNECTION_TIMEOUT / 1000}s`,
     })
 }
 
@@ -685,4 +837,5 @@ export {
     startKeepAlive,
     stopKeepAlive,
     updateCallbacks,
+    forceReconnect,
 }

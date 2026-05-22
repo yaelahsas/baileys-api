@@ -57,7 +57,7 @@ const sendMessage = async (session, receiver, message, options = {}, delayMs = 1
             receiver,
             error: err.message,
         })
-        return Promise.reject(null)
+        return Promise.reject(err)
     }
 }
 
@@ -158,7 +158,7 @@ const getStoreMessage = async (session, messageId, remoteJid) => {
             remoteJid,
             error: err.message,
         })
-        return Promise.reject(null)
+        return Promise.reject(err)
     }
 }
 
@@ -210,7 +210,7 @@ const getMessageMedia = async (session, message) => {
         error('MessageHandler', 'Failed to download media', {
             error: err.message,
         })
-        return Promise.reject(null)
+        return Promise.reject(err)
     }
 }
 

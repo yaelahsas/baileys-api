@@ -152,85 +152,93 @@ const handleMessageUpsert = async (m, sessionId, wa, store) => {
     // Auto read messages if enabled
     await autoReadMessages(currentWa, messages)
 
-    // Process each message
-    const messageTmp = await Promise.all(
-        messages.map(async (msg) => {
-            try {
-                debug('WhatsApp', 'Processing message', {
+    // Process each message sequentially to avoid race conditions
+    // When multiple messages arrive in the same group at the same time,
+    // concurrent processing can cause conflicts (e.g., both try to reply, download same media, etc.)
+    const messageTmp = []
+    for (const msg of messages) {
+        try {
+            debug('WhatsApp', 'Processing message', {
+                sessionId,
+                messageId: msg.key.id,
+                from: msg.key.remoteJid,
+            })
+
+            if (!msg.message) {
+                debug('WhatsApp', 'Message has no content, skipping', {
                     sessionId,
                     messageId: msg.key.id,
-                    from: msg.key.remoteJid,
                 })
+                continue
+            }
 
-                const typeMessage = Object.keys(msg.message)[0]
-                debug('WhatsApp', 'Message type detected', {
-                    sessionId,
-                    messageType: typeMessage,
-                })
+            const typeMessage = Object.keys(msg.message)[0]
+            debug('WhatsApp', 'Message type detected', {
+                sessionId,
+                messageType: typeMessage,
+            })
 
-                // Update message status
-                updateMessageStatus(msg)
+            // Update message status
+            updateMessageStatus(msg)
 
-                // Handle image messages from groups
-                if (typeMessage === 'imageMessage' && msg.key.remoteJid.endsWith('@g.us')) {
-                    debug('WhatsApp', 'Image message detected in group', {
+            // For group messages, always route through handleGroupCommands first
+            // This ensures command handling takes priority over raw image processing
+            // handleGroupCommands will call handleGroupImageMessage internally when needed
+            if (msg.key.remoteJid.endsWith('@g.us')) {
+                // Try command handler first for ALL group messages (text, image, extendedText)
+                const handled = await handleGroupCommands(currentWa, msg, sessionId)
+
+                if (handled) {
+                    debug('WhatsApp', 'Message processed as group command', {
+                        sessionId,
+                        messageId: msg.key.id,
+                    })
+                    // Command was handled, skip further processing
+                    messageTmp.push(msg)
+                    continue
+                }
+
+                // If not a command, handle image-only messages (no caption/command)
+                if (typeMessage === 'imageMessage' && !msg.message.imageMessage?.caption) {
+                    debug('WhatsApp', 'Image without caption in group, processing raw', {
                         sessionId,
                         groupId: msg.key.remoteJid,
                     })
                     await handleGroupImageMessage(currentWa, msg, sessionId)
-                    debug('WhatsApp', 'handleGroupImageMessage completed', {
-                        sessionId,
-                    })
+                    messageTmp.push(msg)
+                    continue
                 }
 
-                // Handle text commands from groups
-                if (
-                    msg.key.remoteJid.endsWith('@g.us') &&
-                    (typeMessage === 'conversation' || typeMessage === 'extendedTextMessage')
-                ) {
-                    debug('WhatsApp', 'Text message detected in group', {
-                        sessionId,
-                        groupId: msg.key.remoteJid,
-                    })
-
-                    const handled = await handleGroupCommands(currentWa, msg, sessionId)
-
-                    if (handled) {
-                        debug('WhatsApp', 'Message processed as command', {
-                            sessionId,
-                        })
-                        return
-                    } else {
-                        debug('WhatsApp', 'Message is not a command, continuing normal processing', {
-                            sessionId,
-                        })
-                    }
-                }
+                debug('WhatsApp', 'Group message not a command, continuing', {
+                    sessionId,
+                    messageId: msg.key.id,
+                })
+            }
 
                 // Process media for webhook if enabled
-                if (
-                    ['documentMessage', 'imageMessage', 'videoMessage', 'audioMessage'].includes(typeMessage) &&
-                    process.env.APP_WEBHOOK_FILE_IN_BASE64 === 'true'
-                ) {
-                    return await processMediaForWebhook(currentWa, msg, typeMessage)
-                }
-
-                debug('WhatsApp', 'Message processing completed', {
-                    sessionId,
-                    messageId: msg.key.id,
-                })
-                return msg
-
-            } catch (err) {
-                error('WhatsApp', 'Failed to process message', {
-                    sessionId,
-                    messageId: msg.key.id,
-                    error: err.message,
-                })
-                return {}
+            if (
+                ['documentMessage', 'imageMessage', 'videoMessage', 'audioMessage'].includes(typeMessage) &&
+                process.env.APP_WEBHOOK_FILE_IN_BASE64 === 'true'
+            ) {
+                messageTmp.push(await processMediaForWebhook(currentWa, msg, typeMessage))
+                continue
             }
-        }),
-    )
+
+            debug('WhatsApp', 'Message processing completed', {
+                sessionId,
+                messageId: msg.key.id,
+            })
+            messageTmp.push(msg)
+
+        } catch (err) {
+            error('WhatsApp', 'Failed to process message', {
+                sessionId,
+                messageId: msg.key.id,
+                error: err.message,
+            })
+            messageTmp.push({})
+        }
+    }
 
     debug('WhatsApp', 'Sending data to webhook', {
         sessionId,
@@ -549,6 +557,7 @@ export const retries = sessionManager.retries
 export const msgRetryCounterCache = sessionManager.msgRetryCounterCache
 export const sessionsDir = sessionManager.sessionsDir
 export const shouldReconnect = sessionManager.shouldReconnect
+export const forceReconnect = sessionManager.forceReconnect
 
 export {
     createSession,

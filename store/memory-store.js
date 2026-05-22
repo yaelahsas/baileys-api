@@ -892,48 +892,69 @@ class ConcurrentStore extends EventEmitter {
         return [];
     }
 
-    async loadMessages(jid, messageId = null, options = {}) {
-        const {
-            limit = 50,
-            offset = 0,
-            before = null,
-            after = null,
-            sortOrder = 'desc'
-        } = options;
-
+    async loadMessages(jid, limitOrMessageId = 25, cursor = null) {
         const normalizedJid = jidNormalizedUser(jid);
         const chatMessages = this.messages.get(normalizedJid);
 
         if (!chatMessages) return [];
 
-        // **If messageId is provided, search for that specific message**
-        if (messageId) {
-            const message = chatMessages.get(messageId);
+        // **If cursor is provided, it's the new API: loadMessages(jid, limit, cursor)**
+        if (cursor && typeof cursor === 'object' && cursor.before) {
+            const limit = typeof limitOrMessageId === 'number' ? limitOrMessageId : 25;
+            const cursorMsgId = cursor.before.id;
+            const cursorFromMe = cursor.before.fromMe;
+
+            let msgsArray = Array.from(chatMessages.values());
+
+            // Find the cursor message index
+            const cursorIndex = msgsArray.findIndex(msg =>
+                msg.key?.id === cursorMsgId && msg.key?.fromMe === cursorFromMe
+            );
+
+            if (cursorIndex === -1) {
+                // Cursor message not found, return messages from the end
+                msgsArray.sort((a, b) => {
+                    const dateA = a.messageTimestamp || 0;
+                    const dateB = b.messageTimestamp || 0;
+                    return dateB - dateA;
+                });
+                return msgsArray.slice(0, limit);
+            }
+
+            // Sort by timestamp descending (newest first)
+            msgsArray.sort((a, b) => {
+                const dateA = a.messageTimestamp || 0;
+                const dateB = b.messageTimestamp || 0;
+                return dateB - dateA;
+            });
+
+            // Find the cursor in the sorted array
+            const sortedCursorIndex = msgsArray.findIndex(msg =>
+                msg.key?.id === cursorMsgId && msg.key?.fromMe === cursorFromMe
+            );
+
+            // Return messages after the cursor position (older messages)
+            return msgsArray.slice(sortedCursorIndex + 1, sortedCursorIndex + 1 + limit);
+        }
+
+        // **If limitOrMessageId is a string, it's the old API: loadMessages(jid, messageId)**
+        if (typeof limitOrMessageId === 'string') {
+            const message = chatMessages.get(limitOrMessageId);
             return message ? [message] : [];
         }
 
-        // **Original behavior if there is no messageId**
+        // **Default: loadMessages(jid, limit) - return latest messages**
+        const limit = typeof limitOrMessageId === 'number' ? limitOrMessageId : 25;
+
         let msgsArray = Array.from(chatMessages.values());
-
-        if (before) {
-            msgsArray = msgsArray.filter(msg =>
-                (msg.messageTimestamp || 0) < before
-            );
-        }
-
-        if (after) {
-            msgsArray = msgsArray.filter(msg =>
-                (msg.messageTimestamp || 0) > after
-            );
-        }
 
         msgsArray.sort((a, b) => {
             const dateA = a.messageTimestamp || 0;
             const dateB = b.messageTimestamp || 0;
-            return sortOrder === 'desc' ? dateB - dateA : dateA - dateB;
+            return dateB - dateA;
         });
 
-        return msgsArray.slice(offset, offset + limit);
+        return msgsArray.slice(0, limit);
     }
 }
 

@@ -16,7 +16,8 @@ import response from './../response.js'
 import { compareAndFilter, fileExists, isUrlValid } from './../utils/functions.js'
 
 const getList = (req, res) => {
-    return response(res, 200, true, '', getChatList(res.locals.sessionId))
+    const session = getSession(res.locals.sessionId)
+    return response(res, 200, true, '', getChatList(session))
 }
 
 const send = async (req, res) => {

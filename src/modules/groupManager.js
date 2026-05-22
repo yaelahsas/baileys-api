@@ -301,7 +301,17 @@ const acceptInvite = async (session, invite) => {
  */
 const getChatList = (session, isGroup = false) => {
     const filter = isGroup ? '@g.us' : '@s.whatsapp.net'
-    const chats = session.store.chats
+    const chats = session?.store?.chats
+
+    if (!chats) {
+        error('GroupManager', 'Store or chats not available on session', {
+            hasSession: !!session,
+            hasStore: !!session?.store,
+            hasChats: !!session?.store?.chats,
+        })
+        return []
+    }
+
     const result = [...chats.values()].filter((chat) => chat.id.endsWith(filter))
     
     debug('GroupManager', 'Retrieved chat list', {
