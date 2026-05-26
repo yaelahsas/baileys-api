@@ -16,6 +16,7 @@
 
 // Import all modules
 import * as sessionManager from './src/modules/sessionManager.js'
+import { journalQueue, JournalStatus } from './src/modules/journalQueue.js'
 
 import {
     sendMessage,
@@ -301,6 +302,26 @@ const handleConnectionUpdate = async (update, sessionId, wa, store) => {
             })
             registerSessionHandlers(sessionId, currentWa)
         }
+
+        // Process pending journal entries from the queue when connection opens
+        // This ensures that journals that failed to send (due to API being down
+        // or bot being disconnected) are retried when the bot comes back online
+        info('WhatsApp', 'Processing pending journal queue on connection open', {
+            sessionId,
+        })
+        journalQueue.processPendingBySession(sessionId).then((result) => {
+            if (result.processed > 0) {
+                success('WhatsApp', 'Pending journals processed', {
+                    sessionId,
+                    ...result,
+                })
+            }
+        }).catch((err) => {
+            error('WhatsApp', 'Failed to process pending journal queue', {
+                sessionId,
+                error: err.message,
+            })
+        })
     }
 
     if (connection === 'close') {
@@ -490,6 +511,24 @@ const init = () => {
         botStartTime: new Date(BOT_START_TIME * 1000).toISOString(),
     })
 
+    // Initialize the journal queue database
+    journalQueue.init()
+    // Set the send message callback for delayed journal notifications
+    journalQueue.setSendMessageCallback(async (sessionId, groupJid, message) => {
+        const wa = sessionManager.getSession(sessionId)
+        if (wa) {
+            try {
+                await wa.sendMessage(groupJid, message)
+            } catch (err) {
+                error('JournalQueue', 'Failed to send notification', {
+                    sessionId,
+                    groupJid,
+                    error: err.message,
+                })
+            }
+        }
+    })
+
     // Pass null callbacks to sessionManager.init() - they will be set up properly
     // in the setTimeout below after sessions are restored
     sessionManager.init(
@@ -604,5 +643,7 @@ export {
     setupEventListeners,
     handleMessageUpsert,
     handleConnectionUpdate,
+    journalQueue,
+    JournalStatus,
     BOT_START_TIME,
 }

@@ -25,6 +25,7 @@ import {
 } from '../utils/logger.js'
 import fs from 'fs'
 import { generateVoiceNote } from '../utils/tts.js'
+import { journalQueue, JournalStatus } from './journalQueue.js'
 
 /**
  * Authorized phone numbers for command access
@@ -1084,19 +1085,64 @@ daring 7h matematika algoritma dasar
         console.log('- Metode :', metode)
         console.log('- Jenis  :', jenis)
 
-        // Send to API with retry logic
+        // === JOURNAL QUEUE SYSTEM ===
+        // Step 1: Check deduplication - if this message was already sent, skip
+        const messageId = msg.key.id
+        const existingEntry = journalQueue.checkMessage(messageId)
+
+        if (existingEntry && existingEntry.status === JournalStatus.SENT) {
+            console.log('[INFO] Jurnal sudah dikirim sebelumnya, skip:', messageId)
+            info('CommandHandler', 'Journal already sent, skipping', {
+                messageId,
+                entryId: existingEntry.id,
+            })
+            await wa.sendMessage(msg.key.remoteJid, {
+                text: '✅ Jurnal ini sudah berhasil dikirim sebelumnya.',
+            }, { quoted: msg })
+            return
+        }
+
+        if (existingEntry && existingEntry.status === JournalStatus.PROCESSING) {
+            console.log('[INFO] Jurnal sedang diproses, skip:', messageId)
+            await wa.sendMessage(msg.key.remoteJid, {
+                text: '⏳ Jurnal ini sedang dalam proses pengiriman.',
+            }, { quoted: msg })
+            return
+        }
+
+        // Step 2: Build data and save to database FIRST (persistent queue)
+        const fotoData = `data:${mediaMessage.mimetype};base64,${mediaMessage.base64}`
         const data = {
             no_lid: lid,
             kelas: kelas,
             materi: materi,
             keterangan: 'Jurnal via WhatsApp Bot',
-            foto: `data:${mediaMessage.mimetype};base64,${mediaMessage.base64}`,
+            foto: fotoData,
             tanggal: tanggalKirim,
             metode: metode,
             jenis: jenis,
         }
 
-        console.log('[INFO] Mengirim data ke API dengan retry logic...')
+        const queueEntry = journalQueue.enqueue({
+            messageId: messageId,
+            sessionId: sessionId,
+            groupJid: msg.key.remoteJid,
+            no_lid: lid,
+            kelas: kelas,
+            materi: materi,
+            tanggal: tanggalKirim,
+            metode: metode,
+            jenis: jenis,
+            foto: fotoData,
+            keterangan: 'Jurnal via WhatsApp Bot',
+        })
+
+        console.log('[INFO] Jurnal disimpan ke antrian database:', {
+            queueId: queueEntry.id,
+            isNew: queueEntry.isNew,
+            status: queueEntry.status,
+        })
+
         // React processing
         await wa.sendMessage(msg.key.remoteJid, {
             react: {
@@ -1104,77 +1150,97 @@ daring 7h matematika algoritma dasar
                 key: msg.key,
             },
         })
-        try {
-            const response = await retryApiCall(
-                () =>
-                    axios.post(`${API_CONFIG.base_url}/create_jurnal`, data, {
-                        headers: {
-                            'Content-Type': 'application/json',
-                            'X-API-Key': API_CONFIG.api_key,
-                        },
-                        timeout: API_CONFIG.timeout,
-                    }),
-                API_CONFIG.max_retries,
-                API_CONFIG.retry_delay,
-            )
 
-            if (response.data && response.data.status === 'success') {
-                const jurnalData = response.data.data.jurnal_data
-
-                const successMessage =
-                    `✅ Jurnal berhasil disimpan\n\n` +
-                    `👨‍🏫 Guru   : ${jurnalData.nama_guru}\n` +
-                    (kelas ? `🏫 Kelas  : ${kelas}\n` : '') +
-                    `📚 Materi : ${materi}\n` +
-                    `📅 Tgl    : ${jurnalData.tanggal}\n` +
-                    `💻 Metode : ${metode === 'daring' ? 'Daring' : 'Luring'}\n` +
-                    `📋 Jenis  : ${jenis === 'non_akademik' ? 'Non-Akademik' : 'Akademik'}`
-
-                await wa.sendMessage(msg.key.remoteJid, { text: successMessage }, { quoted: msg })
-                // React sukses
-                await wa.sendMessage(msg.key.remoteJid, {
-                    react: {
-                        text: '✅',
-                        key: msg.key,
-                    },
-                })
-                console.log('[SUCCESS] Jurnal berhasil disimpan')
-            } else {
-                // React gagal
-                await wa.sendMessage(msg.key.remoteJid, {
-                    react: {
-                        text: '❌',
-                        key: msg.key,
-                    },
-                })
-                console.log('[ERROR] Response API gagal:', response.data)
-
-                await wa.sendMessage(
-                    msg.key.remoteJid,
-                    { text: '❌ Gagal menyimpan jurnal. Mohon coba lagi.' },
-                    { quoted: msg },
+        // Step 3: If entry is pending (new or retry), try to send to API immediately
+        // If it fails, the entry stays as 'pending' in DB and will be retried later
+        if (queueEntry.status === JournalStatus.PENDING || queueEntry.status === JournalStatus.FAILED) {
+            console.log('[INFO] Mengirim data ke API dengan retry logic...')
+            try {
+                const response = await retryApiCall(
+                    () =>
+                        axios.post(`${API_CONFIG.base_url}/create_jurnal`, data, {
+                            headers: {
+                                'Content-Type': 'application/json',
+                                'X-API-Key': API_CONFIG.api_key,
+                            },
+                            timeout: API_CONFIG.timeout,
+                        }),
+                    API_CONFIG.max_retries,
+                    API_CONFIG.retry_delay,
                 )
-            }
-        } catch (apiError) {
-            console.error('[ERROR] API call failed after retries:', apiError)
 
-            let errorMessage = '❌ Terjadi kesalahan saat mengirim ke API.'
+                if (response.data && response.data.status === 'success') {
+                    // Mark as sent in database
+                    journalQueue.updateStatus(queueEntry.id, JournalStatus.SENT)
 
-            if (apiError.response) {
-                console.error('[ERROR] API Response:', {
-                    status: apiError.response.status,
-                    data: apiError.response.data,
+                    const jurnalData = response.data.data.jurnal_data
+
+                    const successMessage =
+                        `✅ Jurnal berhasil disimpan\n\n` +
+                        `👨‍🏫 Guru   : ${jurnalData.nama_guru}\n` +
+                        (kelas ? `🏫 Kelas  : ${kelas}\n` : '') +
+                        `📚 Materi : ${materi}\n` +
+                        `📅 Tgl    : ${jurnalData.tanggal}\n` +
+                        `💻 Metode : ${metode === 'daring' ? 'Daring' : 'Luring'}\n` +
+                        `📋 Jenis  : ${jenis === 'non_akademik' ? 'Non-Akademik' : 'Akademik'}`
+
+                    await wa.sendMessage(msg.key.remoteJid, { text: successMessage }, { quoted: msg })
+                    // React sukses
+                    await wa.sendMessage(msg.key.remoteJid, {
+                        react: {
+                            text: '✅',
+                            key: msg.key,
+                        },
+                    })
+                    console.log('[SUCCESS] Jurnal berhasil disimpan')
+                } else {
+                    // API returned but not success - keep as pending for retry
+                    const errorMsg = response.data?.message || 'API returned non-success status'
+                    journalQueue.updateStatus(queueEntry.id, JournalStatus.PENDING, {
+                        lastError: errorMsg,
+                        attempts: 1,
+                    })
+
+                    // React gagal
+                    await wa.sendMessage(msg.key.remoteJid, {
+                        react: {
+                            text: '❌',
+                            key: msg.key,
+                        },
+                    })
+                    console.log('[ERROR] Response API gagal:', response.data)
+
+                    await wa.sendMessage(
+                        msg.key.remoteJid,
+                        { text: '❌ Gagal menyimpan jurnal. Data disimpan ke antrian dan akan dikirim ulang secara otomatis.' },
+                        { quoted: msg },
+                    )
+                }
+            } catch (apiError) {
+                // API call failed - keep as pending for retry later
+                const errorMsg = apiError.response?.data?.message || apiError.message || 'Unknown error'
+                journalQueue.updateStatus(queueEntry.id, JournalStatus.PENDING, {
+                    lastError: errorMsg,
+                    attempts: 1,
                 })
-                errorMessage += `\nStatus: ${apiError.response.status}`
-            } else if (apiError.request) {
-                console.error('[ERROR] No response from API:', apiError.request)
-                errorMessage += '\nTidak ada respons dari server API.'
-            } else {
-                console.error('[ERROR] API Error:', apiError.message)
-                errorMessage += `\nError: ${apiError.message}`
-            }
 
-            await wa.sendMessage(msg.key.remoteJid, { text: errorMessage }, { quoted: msg })
+                console.error('[ERROR] API call failed after retries:', apiError)
+
+                let errorMessage = '❌ Terjadi kesalahan saat mengirim ke API.\n📝 Data jurnal disimpan ke antrian dan akan dikirim ulang secara otomatis ketika server tersedia.'
+
+                if (apiError.response) {
+                    console.error('[ERROR] API Response:', {
+                        status: apiError.response.status,
+                        data: apiError.response.data,
+                    })
+                } else if (apiError.request) {
+                    console.error('[ERROR] No response from API:', apiError.request)
+                } else {
+                    console.error('[ERROR] API Error:', apiError.message)
+                }
+
+                await wa.sendMessage(msg.key.remoteJid, { text: errorMessage }, { quoted: msg })
+            }
         }
     } catch (error) {
         console.error('[ERROR] Exception handleGroupImageMessage:', error)

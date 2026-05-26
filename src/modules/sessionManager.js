@@ -566,6 +566,13 @@ const createSession = async (
         logger,
         msgRetryCounterCache,
         generateHighQualityLinkPreview: true,
+        keepAliveIntervalMs: 30000,
+        connectTimeoutMs: 60000,
+        defaultQueryTimeoutMs: 60000,
+
+        markOnlineOnConnect: true,
+        syncFullHistory: false,
+
         getMessage: (key) => {
             if (store) {
                 const msg = store.loadMessages(key.remoteJid, key.id)
