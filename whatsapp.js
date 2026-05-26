@@ -198,11 +198,14 @@ const handleMessageUpsert = async (m, sessionId, wa, store) => {
                     continue
                 }
 
-                // If not a command, handle image-only messages (no caption/command)
-                if (typeMessage === 'imageMessage' && !msg.message.imageMessage?.caption) {
-                    debug('WhatsApp', 'Image without caption in group, processing raw', {
+                // If not a command, handle image messages (with or without caption)
+                // Caption langsung format like "8K ips" should reach handleGroupImageMessage's
+                // "Mode CAPTION LANGSUNG" branch for parsing kelas + materi
+                if (typeMessage === 'imageMessage') {
+                    debug('WhatsApp', 'Image message in group (no command match), processing via handleGroupImageMessage', {
                         sessionId,
                         groupId: msg.key.remoteJid,
+                        hasCaption: !!msg.message.imageMessage?.caption,
                     })
                     await handleGroupImageMessage(currentWa, msg, sessionId)
                     messageTmp.push(msg)
