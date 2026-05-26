@@ -41,7 +41,7 @@ const AUTHORIZED_NUMBERS = process.env.AUTHORIZED_NUMBERS
  * Known commands that the bot recognizes
  * @type {Array<string>}
  */
-const KNOWN_COMMANDS = ['#laporan', '#jurnal', '#jurnal-daring', '#ekstra', '/menu', '/billing', '/today']
+const KNOWN_COMMANDS = ['#laporan', '#jurnal', '#jurnal-daring', '#ekstra', '/menu', '/billing', '/today', '/rank']
 
 /**
  * Month name to number mapping for Indonesian months
@@ -382,6 +382,26 @@ const handleGroupCommands = async (wa, msg, sessionId) => {
                     })
                 } catch (err) {
                     error('CommandHandler', 'handleTodayCommand failed', {
+                        sessionId,
+                        error: err.message,
+                    })
+                }
+
+                return true
+            }
+
+            case '/rank': {
+                command('CommandHandler', 'Processing /rank command', {
+                    sessionId,
+                })
+
+                try {
+                    await handleRankCommand(wa, msg)
+                    success('CommandHandler', '/rank command processed successfully', {
+                        sessionId,
+                    })
+                } catch (err) {
+                    error('CommandHandler', 'handleRankCommand failed', {
                         sessionId,
                         error: err.message,
                     })
@@ -1280,6 +1300,12 @@ const handleMenuCommand = async (wa, msg) => {
             `📅 */today* - Melihat siapa yang sudah mengisi jurnal hari ini\n` +
             `   Format: /today\n` +
             `   Menampilkan daftar guru yang sudah submit jurnal hari ini\n\n` +
+            `🏅 */rank* - Melihat ranking guru berdasarkan jumlah jurnal\n` +
+            `   Format: /rank [bulan] [tahun]\n` +
+            `   Contoh: /rank\n` +
+            `   Contoh: /rank februari\n` +
+            `   Contoh: /rank februari 2026\n` +
+            `   Contoh: /rank 2 2026\n\n` +
             `📝 *#jurnal* - Input jurnal luring/akademik dengan gambar\n` +
             `   Format: #jurnal [tanggal] kelas materi\n` +
             `   Contoh: #jurnal 7h matematika algoritma dasar\n` +
@@ -1708,6 +1734,246 @@ const handleBillingCommand = async (wa, msg) => {
 }
 
 /**
+ * Handle rank command - retrieves ranking of teachers based on journal upload count
+ *
+ * @param {import('baileys').AnyWASocket} wa - The WhatsApp session
+ * @param {object} msg - The message object
+ */
+const handleRankCommand = async (wa, msg) => {
+    try {
+        const messageContent = msg.message.conversation || msg.message.extendedTextMessage?.text || ''
+
+        if (!messageContent.toLowerCase().startsWith('/rank')) {
+            return
+        }
+
+        const commandParts = messageContent.toLowerCase().split(' ')
+
+        const currentYear = new Date().getFullYear()
+        const currentMonth = new Date().getMonth() + 1
+
+        // Default values
+        let monthNum = currentMonth
+        let yearNum = currentYear
+        let monthLabel = Object.keys(MONTH_MAP).find((k) => MONTH_MAP[k] === currentMonth)
+
+        // Parse command
+        // Format: /rank [bulan] [tahun]
+        // Example: /rank februari 2026
+        // Example: /rank 2 2026
+        // Example: /rank februari
+        // Example: /rank (default: bulan ini)
+
+        if (commandParts.length >= 2) {
+            if (MONTH_MAP[commandParts[1]]) {
+                monthNum = MONTH_MAP[commandParts[1]]
+                monthLabel = commandParts[1]
+            } else {
+                const parsedMonth = parseInt(commandParts[1])
+                if (!isNaN(parsedMonth) && parsedMonth >= 1 && parsedMonth <= 12) {
+                    monthNum = parsedMonth
+                    monthLabel = Object.keys(MONTH_MAP).find((k) => MONTH_MAP[k] === parsedMonth)
+                } else {
+                    await wa.sendMessage(
+                        msg.key.remoteJid,
+                        {
+                            text: '❌ Format salah.\n\nGunakan:\n/rank [bulan] [tahun]\n\nContoh:\n/rank februari 2026\n/rank 2 2026\n/rank februari\n/rank\n\nNama bulan: januari, februari, maret, dst.',
+                        },
+                        { quoted: msg },
+                    )
+                    return
+                }
+            }
+        }
+
+        if (commandParts.length >= 3) {
+            const parsedYear = parseInt(commandParts[2])
+            if (!isNaN(parsedYear) && parsedYear >= 2000 && parsedYear <= 2100) {
+                yearNum = parsedYear
+            } else {
+                await wa.sendMessage(
+                    msg.key.remoteJid,
+                    {
+                        text: '❌ Tahun tidak valid.\n\nGunakan tahun antara 2000-2100.\n\nContoh:\n/rank februari 2026',
+                    },
+                    { quoted: msg },
+                )
+                return
+            }
+        }
+
+        // Build URL
+        const url = `${API_CONFIG.base_url}/get_rank_jurnal?bulan=${monthNum}&tahun=${yearNum}`
+
+        console.log('==============================================')
+        console.log('[RANK] Memulai proses pengambilan ranking jurnal')
+        console.log('[INFO] URL      :', url)
+        console.log('[INFO] Bulan    :', monthNum, `(${monthLabel})`)
+        console.log('[INFO] Tahun    :', yearNum)
+        console.log('==============================================')
+
+        console.log('[STEP 1] Mengambil data ranking dari API dengan retry logic...')
+
+        // React processing
+        await wa.sendMessage(msg.key.remoteJid, {
+            react: {
+                text: '⏳',
+                key: msg.key,
+            },
+        })
+
+        const response = await retryApiCall(
+            () =>
+                axios.get(url, {
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'X-API-Key': API_CONFIG.api_key,
+                    },
+                    timeout: API_CONFIG.timeout,
+                }),
+            API_CONFIG.max_retries,
+            API_CONFIG.retry_delay,
+        )
+
+        console.log('[STEP 2] Response diterima dari API')
+        console.log('[INFO] Status Code:', response.status)
+
+        if (response.status === 200 && response.data) {
+            console.log('[STEP 3] Memformat data ranking...')
+
+            const rankData = response.data.data || []
+            const totalGuru = rankData.length
+
+            console.log('[INFO] Total guru:', totalGuru)
+
+            if (totalGuru === 0) {
+                const noDataMessage =
+                    `🏅 *RANKING JURNAL GURU*\n\n` +
+                    `📅 Bulan: ${monthLabel} ${yearNum}\n\n` +
+                    `❌ *Belum ada data jurnal untuk bulan ini.*\n\n` +
+                    `💡 Gunakan #jurnal untuk menginput jurnal.`
+
+                await wa.sendMessage(msg.key.remoteJid, { text: noDataMessage }, { quoted: msg })
+                await wa.sendMessage(msg.key.remoteJid, {
+                    react: {
+                        text: '✅',
+                        key: msg.key,
+                    },
+                })
+                console.log('[SUCCESS] Pesan "belum ada data" berhasil dikirim')
+            } else {
+                // Calculate statistics
+                const totalJurnal = rankData.reduce((sum, guru) => sum + (guru.total_jurnal || 0), 0)
+                const avgJurnal = totalJurnal / totalGuru
+
+                // Format the ranking list
+                let rankMessage = `🏅 *RANKING JURNAL GURU*\n\n`
+                rankMessage += `📅 Bulan: ${monthLabel} ${yearNum}\n`
+                rankMessage += `📊 Total: ${totalJurnal} jurnal dari ${totalGuru} guru\n`
+                rankMessage += `📈 Rata-rata: ${avgJurnal.toFixed(1)} jurnal/guru\n\n`
+                rankMessage += `🏆 *Top Ranking:*\n\n`
+
+                rankData.forEach((guru, index) => {
+                    const rank = index + 1
+                    let medal = ''
+
+                    if (rank === 1) medal = '🥇'
+                    else if (rank === 2) medal = '🥈'
+                    else if (rank === 3) medal = '🥉'
+                    else medal = `${rank}.`
+
+                    rankMessage += `${medal} ${guru.nama_guru}\n`
+                    rankMessage += `   📝 Jurnal: ${guru.total_jurnal}x`
+
+                    if (guru.total_luring) {
+                        rankMessage += ` (Luring: ${guru.total_luring}`
+                    }
+                    if (guru.total_daring) {
+                        rankMessage += ` | Daring: ${guru.total_daring}`
+                    }
+                    if (guru.total_non_akademik) {
+                        rankMessage += ` | Ekstra: ${guru.total_non_akademik}`
+                    }
+                    if (guru.total_luring || guru.total_daring || guru.total_non_akademik) {
+                        rankMessage += `)`
+                    }
+
+                    rankMessage += '\n'
+                })
+
+                rankMessage += `\n📌 *Catatan:*\n`
+                rankMessage += `   - Data diambil secara real-time dari sistem\n`
+                rankMessage += `   - Ranking berdasarkan jumlah jurnal terbanyak\n`
+                rankMessage += `   - Luring = tatap muka, Daring = online, Ekstra = non-akademik\n\n`
+                rankMessage += `💡 Gunakan #jurnal untuk menginput jurnal.`
+
+                await wa.sendMessage(msg.key.remoteJid, { text: rankMessage }, { quoted: msg })
+
+                await wa.sendMessage(msg.key.remoteJid, {
+                    react: {
+                        text: '✅',
+                        key: msg.key,
+                    },
+                })
+
+                console.log('[SUCCESS] Ranking jurnal berhasil dikirim')
+            }
+        } else {
+            console.log('==============================================')
+            console.log('[ERROR] API mengembalikan status bukan 200')
+            console.log('[ERROR] Status :', response.status)
+            console.log('==============================================')
+
+            await wa.sendMessage(
+                msg.key.remoteJid,
+                { text: '❌ Maaf, terjadi kesalahan saat mengambil data ranking jurnal.' },
+                { quoted: msg },
+            )
+            await wa.sendMessage(msg.key.remoteJid, {
+                react: {
+                    text: '❌',
+                    key: msg.key,
+                },
+            })
+        }
+    } catch (error) {
+        console.log('==============================================')
+        console.log('[ERROR] Gagal saat memproses perintah /rank')
+        console.log('==============================================')
+
+        if (error.response) {
+            console.log('[ERROR] Status  :', error.response.status)
+            console.log('[ERROR] Data    :', error.response.data)
+        } else if (error.request) {
+            console.log('[ERROR] Tidak ada response dari API')
+        } else {
+            console.log('[ERROR] Message :', error.message)
+        }
+
+        console.log('[ERROR] Stack Trace:')
+        console.log(error.stack)
+
+        console.log('==============================================')
+
+        try {
+            await wa.sendMessage(
+                msg.key.remoteJid,
+                { text: '❌ Maaf, terjadi kesalahan saat memproses permintaan ranking jurnal.' },
+                { quoted: msg },
+            )
+            await wa.sendMessage(msg.key.remoteJid, {
+                react: {
+                    text: '❌',
+                    key: msg.key,
+                },
+            })
+        } catch (sendErr) {
+            console.log('[ERROR] Gagal mengirim pesan error ke WhatsApp:', sendErr.message)
+        }
+    }
+}
+
+/**
  * Handle today command - retrieves list of teachers who have submitted journals today
  *
  * @param {import('baileys').AnyWASocket} wa - The WhatsApp session
@@ -1868,6 +2134,7 @@ export {
     handleMenuCommand,
     handleBillingCommand,
     handleTodayCommand,
+    handleRankCommand,
     mapAliasKelas,
     isAuthorized,
 }
