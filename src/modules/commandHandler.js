@@ -1290,8 +1290,8 @@ const handleMenuCommand = async (wa, msg) => {
             `📊 *#laporan* - Mengambil laporan\n` +
             `   Format: #laporan [bulan]\n` +
             `   Contoh: #laporan februari\n` +
-            `   Format: #laporan guru @tag\n` +
-            `   Contoh: #laporan guru @628xxxx\n\n` +
+            `   Format: #laporan guru @tag [bulan]\n` +
+            `   Contoh: #laporan guru @628xxxx februari\n\n` +
             `💰 */billing* - Mengambil laporan billing bulanan\n` +
             `   Format: /billing [bulan] [tahun]\n` +
             `   Contoh: /billing februari 2026\n` +
@@ -1411,6 +1411,13 @@ const handleReportCommand = async (wa, msg) => {
             monthLabel = commandParts[2]
         } else if (commandParts[1] === 'guru') {
             reportType = 'guru'
+
+            const requestedMonth = commandParts.slice(2).find((part) => MONTH_MAP[part])
+
+            if (requestedMonth) {
+                monthNum = MONTH_MAP[requestedMonth]
+                monthLabel = requestedMonth
+            }
         }
 
         // Build URL and filename
