@@ -11,21 +11,18 @@
 
 import axios from 'axios'
 import { downloadMediaMessage } from 'baileys'
-import {
-    info,
-    success,
-    error,
-    warning,
-    command,
-    api,
-    apiCall,
-    report,
-    debug,
-    separator,
-} from '../utils/logger.js'
+import { info, success, error, warning, command, api, apiCall, report, debug, separator } from '../utils/logger.js'
 import fs from 'fs'
 import { generateVoiceNote } from '../utils/tts.js'
 import { journalQueue, JournalStatus } from './journalQueue.js'
+
+/**
+ * Sentinel returned by handleGroupImageMessage when the sender cannot be resolved
+ * (e.g. Baileys delivered a fresh upsert without key.participant yet). whatsapp.js
+ * uses this to retry processing after a short delay instead of failing immediately.
+ * @type {string}
+ */
+const SENDER_UNRESOLVED = 'SENDER_UNRESOLVED'
 
 /**
  * Authorized phone numbers for command access
@@ -34,7 +31,7 @@ import { journalQueue, JournalStatus } from './journalQueue.js'
  * @type {Array<string>}
  */
 const AUTHORIZED_NUMBERS = process.env.AUTHORIZED_NUMBERS
-    ? process.env.AUTHORIZED_NUMBERS.split(',').map(n => n.trim())
+    ? process.env.AUTHORIZED_NUMBERS.split(',').map((n) => n.trim())
     : ['6285212870484', '6283853399847']
 
 /**
@@ -202,7 +199,7 @@ const sanitizeText = (text) => {
  * Extract phone number from a JID (WhatsApp ID)
  * Properly handles both user JIDs (xxx@s.whatsapp.net) and group JIDs (xxx@g.us)
  * For group JIDs, returns the raw numeric part (which is the group ID, not a phone number)
- * 
+ *
  * @param {string} jid - The JID string to extract from
  * @returns {string} The extracted number portion
  */
@@ -215,7 +212,7 @@ const extractPhoneNumber = (jid) => {
 
 /**
  * Check if a JID is a personal WhatsApp number (not a group)
- * 
+ *
  * @param {string} jid - The JID to check
  * @returns {boolean} True if it's a personal number JID
  */
@@ -225,8 +222,70 @@ const isPersonalJid = (jid) => {
 }
 
 /**
+ * Determine if a message was sent by the bot's own WhatsApp account.
+ * Baileys marks own messages with key.fromMe, and on some devices the
+ * participant resolves to the account's own number in remoteJid.
+ *
+ * @param {object} msg - The message object
+ * @returns {boolean} True if the message appears to be from the bot itself
+ */
+const thisMessageIsFromSelf = (msg) => {
+    if (!msg?.key) return false
+    // Own messages are explicitly flagged by Baileys; only treat that as self.
+    return msg.key.fromMe === true
+}
+
+/**
+ * Extract the sender's LID for a message sent by the bot's own account.
+ * Prefers key.participant; participantAlt may hold the phone-number JID for
+ * linked devices; remoteJid is only valid outside groups.
+ *
+ * @param {object} msg - The message object
+ * @returns {string} The extracted LID
+ */
+const selfSenderLid = (msg) => {
+    if (msg?.key?.participant) return extractPhoneNumber(msg.key.participant)
+    if (msg?.key?.participantAlt) return extractPhoneNumber(msg.key.participantAlt)
+    if (msg?.key?.remoteJid && isPersonalJid(msg.key.remoteJid)) return extractPhoneNumber(msg.key.remoteJid)
+    return ''
+}
+
+/**
+ * Resolve the sender's LID by looking up the message in the session store.
+ * Baileys may deliver a live message with key.participant undefined on the first
+ * upsert, but the store can hold the fully-populated message once processed.
+ *
+ * @param {import('baileys').AnyWASocket} wa - The WhatsApp session
+ * @param {object} msg - The message object
+ * @returns {string} The resolved LID, or empty string if it cannot be determined
+ */
+const resolveSenderFromStore = async (wa, msg = {}) => {
+    const jid = msg?.key?.remoteJid
+    const messageId = msg?.key?.id
+    if (!jid || !messageId || !wa?.store) return ''
+
+    try {
+        const stored = await wa.store.loadMessages(jid, messageId)
+        if (stored && stored.length > 0) {
+            const key = stored[0]?.key || {}
+            if (key.participant) return extractPhoneNumber(key.participant)
+            if (key.participantAlt) return extractPhoneNumber(key.participantAlt)
+            if (key.fromMe && key.remoteJid) return extractPhoneNumber(key.remoteJid)
+        }
+    } catch (err) {
+        warning('CommandHandler', 'Store-based sender resolution failed', {
+            jid,
+            messageId,
+            error: err.message,
+        })
+    }
+
+    return ''
+}
+
+/**
  * Check if a user is authorized to use commands
- * 
+ *
  * @param {string} sender - The sender's JID
  * @returns {boolean} True if authorized, false otherwise
  */
@@ -237,7 +296,7 @@ const isAuthorized = (sender) => {
 
 /**
  * Handle group commands
- * 
+ *
  * @param {import('baileys').AnyWASocket} wa - The WhatsApp session
  * @param {object} msg - The message object
  * @param {string} sessionId - The session ID
@@ -254,7 +313,8 @@ const handleGroupCommands = async (wa, msg, sessionId) => {
         // - conversation: plain text messages
         // - extendedTextMessage: text with links/mentions/quotes
         // - imageMessage.caption: images with caption (like "#jurnal 8K matematika" sent with a photo)
-        const messageContent = msg.message.conversation || msg.message.extendedTextMessage?.text || msg.message.imageMessage?.caption || ''
+        const messageContent =
+            msg.message.conversation || msg.message.extendedTextMessage?.text || msg.message.imageMessage?.caption || ''
 
         if (!messageContent) {
             debug('CommandHandler', 'Empty message, skipping command handler', {
@@ -281,7 +341,31 @@ const handleGroupCommands = async (wa, msg, sessionId) => {
         }
 
         // Authorization check - use participant (actual sender) not remoteJid (group ID)
-        const sender = msg.key.participant || msg.key.participantAlt || msg.key.remoteJid
+        // Use the same robust sender resolution as handleGroupImageMessage
+        let sender = msg.key.participant
+        if (!sender && msg.message?.extendedTextMessage?.contextInfo?.participant) {
+            sender = msg.message.extendedTextMessage.contextInfo.participant
+        }
+        if (!sender && msg.message?.imageMessage?.contextInfo?.participant) {
+            sender = msg.message.imageMessage.contextInfo.participant
+        }
+        if (!sender && msg.message?.videoMessage?.contextInfo?.participant) {
+            sender = msg.message.videoMessage.contextInfo.participant
+        }
+        if (!sender && msg.message?.documentMessage?.contextInfo?.participant) {
+            sender = msg.message.documentMessage.contextInfo.participant
+        }
+        if (!sender) sender = msg.key.participantAlt
+        if (!sender && thisMessageIsFromSelf(msg)) {
+            sender = selfSenderLid(msg)
+        }
+        if (!sender && isPersonalJid(msg.key.remoteJid)) {
+            sender = msg.key.remoteJid
+        }
+        if (!sender) {
+            // Store-based fallback
+            sender = (await resolveSenderFromStore(wa, msg)) || msg.key.remoteJid
+        }
         const phoneNumber = extractPhoneNumber(sender)
 
         debug('CommandHandler', 'Authorization check', {
@@ -420,9 +504,9 @@ const handleGroupCommands = async (wa, msg, sessionId) => {
                 let customLid = null
 
                 // Extract custom LID from @mention
-               const mentionedJid =
-    msg.message?.extendedTextMessage?.contextInfo?.mentionedJid ||
-    msg.message?.imageMessage?.contextInfo?.mentionedJid
+                const mentionedJid =
+                    msg.message?.extendedTextMessage?.contextInfo?.mentionedJid ||
+                    msg.message?.imageMessage?.contextInfo?.mentionedJid
                 if (mentionedJid && mentionedJid.length > 0) {
                     customLid = extractPhoneNumber(mentionedJid[0])
                     info('CommandHandler', 'Custom LID from @mention', {
@@ -612,7 +696,15 @@ Atau untuk guru lain (tag @guru):
                 })
 
                 try {
-                    await handleGroupImageMessage(wa, msg, sessionId, tanggalFinalDaring, 'daring', 'akademik', customLidDaring)
+                    await handleGroupImageMessage(
+                        wa,
+                        msg,
+                        sessionId,
+                        tanggalFinalDaring,
+                        'daring',
+                        'akademik',
+                        customLidDaring,
+                    )
                     success('CommandHandler', '#jurnal-daring command processed successfully', {
                         sessionId,
                     })
@@ -719,7 +811,15 @@ Atau untuk guru lain (tag @guru):
                 })
 
                 try {
-                    await handleGroupImageMessage(wa, msg, sessionId, tanggalFinalEkstra, 'luring', 'non_akademik', customLidEkstra)
+                    await handleGroupImageMessage(
+                        wa,
+                        msg,
+                        sessionId,
+                        tanggalFinalEkstra,
+                        'luring',
+                        'non_akademik',
+                        customLidEkstra,
+                    )
                     success('CommandHandler', '#ekstra command processed successfully', {
                         sessionId,
                     })
@@ -765,7 +865,15 @@ Atau untuk guru lain (tag @guru):
  * @param {string} jenis - Jenis jurnal: 'akademik' (default) atau 'non_akademik'
  * @param {string|null} customLid - Custom LID (no_lid guru) from @mention, overrides default LID detection
  */
-const handleGroupImageMessage = async (wa, msg, sessionId, tanggalCustom = null, metode = 'luring', jenis = 'akademik', customLid = null) => {
+const handleGroupImageMessage = async (
+    wa,
+    msg,
+    sessionId,
+    tanggalCustom = null,
+    metode = 'luring',
+    jenis = 'akademik',
+    customLid = null,
+) => {
     try {
         console.log('==============================================')
         console.log('[JURNAL] Memulai proses input jurnal')
@@ -780,6 +888,9 @@ const handleGroupImageMessage = async (wa, msg, sessionId, tanggalCustom = null,
         // Priority: customLid (from @mention) > quoted participant > sender participant
         // IMPORTANT: In groups, msg.key.remoteJid is the GROUP ID, NOT the sender's phone number
         // We must use msg.key.participant (the sender's actual JID in the group) or quoted participant
+        // Baileys may deliver the first upsert of a new message with key.participant undefined
+        // (participant resolution is async / LID mapping not yet cached), so we add fallbacks:
+        // contextInfo.participant (media messages) and store-based lookup.
         try {
             if (customLid) {
                 lid = customLid
@@ -788,6 +899,16 @@ const handleGroupImageMessage = async (wa, msg, sessionId, tanggalCustom = null,
                 const quotedParticipant = msg.message.extendedTextMessage.contextInfo.participant
                 lid = extractPhoneNumber(quotedParticipant)
                 console.log('[INFO] Mode QUOTE - LID dari quoted participant:', lid)
+            } else if (msg.message?.imageMessage?.contextInfo?.participant) {
+                // Direct image message: sender is in imageMessage.contextInfo.participant
+                lid = extractPhoneNumber(msg.message.imageMessage.contextInfo.participant)
+                console.log('[INFO] Mode IMAGE_CONTEXT - LID dari imageMessage.contextInfo.participant:', lid)
+            } else if (msg.message?.videoMessage?.contextInfo?.participant) {
+                lid = extractPhoneNumber(msg.message.videoMessage.contextInfo.participant)
+                console.log('[INFO] Mode VIDEO_CONTEXT - LID dari videoMessage.contextInfo.participant:', lid)
+            } else if (msg.message?.documentMessage?.contextInfo?.participant) {
+                lid = extractPhoneNumber(msg.message.documentMessage.contextInfo.participant)
+                console.log('[INFO] Mode DOCUMENT_CONTEXT - LID dari documentMessage.contextInfo.participant:', lid)
             } else if (msg.key.participant) {
                 // msg.key.participant is the actual sender's JID in a group
                 // This is the correct field to use for sender identification in groups
@@ -797,15 +918,27 @@ const handleGroupImageMessage = async (wa, msg, sessionId, tanggalCustom = null,
                 // participantAlt may contain the linked device ID
                 lid = extractPhoneNumber(msg.key.participantAlt)
                 console.log('[INFO] Mode PARTICIPANT_ALT - LID dari msg.key.participantAlt:', lid)
+            } else if (thisMessageIsFromSelf(msg)) {
+                // Messages sent by the bot's own account carry the bot's JID in remoteJid/participant
+                lid = selfSenderLid(msg)
+                console.log('[INFO] Mode SELF - LID dari pesan bot sendiri:', lid)
             } else if (isPersonalJid(msg.key.remoteJid)) {
                 // Only use remoteJid if it's a personal chat (not a group)
                 lid = extractPhoneNumber(msg.key.remoteJid)
                 console.log('[INFO] Mode PERSONAL CHAT - LID dari remoteJid:', lid)
             } else {
-                // If we're in a group and no participant info is available,
-                // this is a Baileys data issue - we cannot reliably determine the sender
-                console.error('[ERROR] Cannot determine sender in group - no participant info available')
-                throw new Error('Tidak dapat mengidentifikasi pengirim dalam grup')
+                // Store-based fallback: the message may already be in the session store with
+                // a fully populated key.participant, even though the live msg object lacks it.
+                const storedSender = await resolveSenderFromStore(wa, msg)
+                if (storedSender) {
+                    lid = storedSender
+                    console.log('[INFO] Mode STORE - LID dari session store:', lid)
+                } else {
+                    // If we're in a group and no participant info is available,
+                    // this is a Baileys data issue - we cannot reliably determine the sender
+                    console.error('[ERROR] Cannot determine sender in group - no participant info available')
+                    throw new Error('Tidak dapat mengidentifikasi pengirim dalam grup')
+                }
             }
 
             if (!lid) {
@@ -815,12 +948,29 @@ const handleGroupImageMessage = async (wa, msg, sessionId, tanggalCustom = null,
             // Validate that lid looks like a phone number (digits only, reasonable length)
             const lidClean = lid.replace(/\D/g, '')
             if (lidClean.length < 8 || lidClean.length > 15) {
-                console.warn('[WARN] LID does not look like a valid phone number:', lid, '(length:', lidClean.length, ')')
+                console.warn(
+                    '[WARN] LID does not look like a valid phone number:',
+                    lid,
+                    '(length:',
+                    lidClean.length,
+                    ')',
+                )
                 // Don't throw here - some systems use different ID formats
                 // But log a warning for debugging
             }
         } catch (error) {
             console.error('[ERROR] Gagal mendapatkan LID:', error)
+
+            // If sender couldn't be resolved (likely a fresh upsert with missing participant),
+            // return a sentinel so whatsapp.js can retry processing after a short delay
+            // instead of failing immediately. This fixes "first send fails, second works".
+            if (
+                error.message === 'Tidak dapat mengidentifikasi pengirim dalam grup' ||
+                error.message === 'Tidak dapat mengidentifikasi pengirim'
+            ) {
+                return SENDER_UNRESOLVED
+            }
+
             await wa.sendMessage(
                 msg.key.remoteJid,
                 { text: '❌ Gagal mengidentifikasi pengirim. Silakan coba lagi atau tag @nomor Anda.' },
@@ -880,12 +1030,7 @@ const handleGroupImageMessage = async (wa, msg, sessionId, tanggalCustom = null,
                     return
                 }
 
-                const buffer = await downloadMediaMessage(
-                    msg,
-                    'buffer',
-                    {},
-                    { reuploadRequest: wa.updateMediaMessage },
-                )
+                const buffer = await downloadMediaMessage(msg, 'buffer', {}, { reuploadRequest: wa.updateMediaMessage })
 
                 mediaMessage = {
                     mimetype: imageData.mimetype,
@@ -1116,17 +1261,25 @@ daring 7h matematika algoritma dasar
                 messageId,
                 entryId: existingEntry.id,
             })
-            await wa.sendMessage(msg.key.remoteJid, {
-                text: '✅ Jurnal ini sudah berhasil dikirim sebelumnya.',
-            }, { quoted: msg })
+            await wa.sendMessage(
+                msg.key.remoteJid,
+                {
+                    text: '✅ Jurnal ini sudah berhasil dikirim sebelumnya.',
+                },
+                { quoted: msg },
+            )
             return
         }
 
         if (existingEntry && existingEntry.status === JournalStatus.PROCESSING) {
             console.log('[INFO] Jurnal sedang diproses, skip:', messageId)
-            await wa.sendMessage(msg.key.remoteJid, {
-                text: '⏳ Jurnal ini sedang dalam proses pengiriman.',
-            }, { quoted: msg })
+            await wa.sendMessage(
+                msg.key.remoteJid,
+                {
+                    text: '⏳ Jurnal ini sedang dalam proses pengiriman.',
+                },
+                { quoted: msg },
+            )
             return
         }
 
@@ -1232,7 +1385,9 @@ daring 7h matematika algoritma dasar
 
                     await wa.sendMessage(
                         msg.key.remoteJid,
-                        { text: '❌ Gagal menyimpan jurnal. Data disimpan ke antrian dan akan dikirim ulang secara otomatis.' },
+                        {
+                            text: '❌ Gagal menyimpan jurnal. Data disimpan ke antrian dan akan dikirim ulang secara otomatis.',
+                        },
                         { quoted: msg },
                     )
                 }
@@ -1246,7 +1401,8 @@ daring 7h matematika algoritma dasar
 
                 console.error('[ERROR] API call failed after retries:', apiError)
 
-                let errorMessage = '❌ Terjadi kesalahan saat mengirim ke API.\n📝 Data jurnal disimpan ke antrian dan akan dikirim ulang secara otomatis ketika server tersedia.'
+                let errorMessage =
+                    '❌ Terjadi kesalahan saat mengirim ke API.\n📝 Data jurnal disimpan ke antrian dan akan dikirim ulang secara otomatis ketika server tersedia.'
 
                 if (apiError.response) {
                     console.error('[ERROR] API Response:', {
@@ -1333,45 +1489,51 @@ const handleMenuCommand = async (wa, msg) => {
             `⚠️ *Akses Terbatas*\n` +
             `   Fitur ini hanya dapat diakses oleh nomor terdaftar.`
 
+        await wa.sendMessage(
+            msg.key.remoteJid,
+            {
+                text: menuMessage,
+            },
+            { quoted: msg },
+        )
+
+        const voice = await generateVoiceNote(`Berikut menu yang ada didalam bot`)
+
+        await wa.sendMessage(
+            msg.key.remoteJid,
+            {
+                audio: fs.readFileSync(voice.oggPath),
+                mimetype: 'audio/ogg; codecs=opus',
+                ptt: true,
+            },
+            { quoted: msg },
+        )
+        fs.unlinkSync(voice.mp3Path)
+        fs.unlinkSync(voice.oggPath)
+        // React sukses
         await wa.sendMessage(msg.key.remoteJid, {
-            text: menuMessage,
-        }, { quoted: msg })
-
-        const voice = await generateVoiceNote(
-    `Berikut menu yang ada didalam bot`
-)
-
-await wa.sendMessage(
-    msg.key.remoteJid,
-    {
-        audio: fs.readFileSync(voice.oggPath),
-        mimetype: 'audio/ogg; codecs=opus',
-        ptt: true,
-    },
-    { quoted: msg }
-)
-fs.unlinkSync(voice.mp3Path)
-fs.unlinkSync(voice.oggPath)
-     // React sukses
-                await wa.sendMessage(msg.key.remoteJid, {
-                    react: {
-                        text: '✅',
-                        key: msg.key,
-                    },
-                })
+            react: {
+                text: '✅',
+                key: msg.key,
+            },
+        })
         console.log('[SUCCESS] Menu berhasil ditampilkan')
     } catch (error) {
-             // React gagal
-                await wa.sendMessage(msg.key.remoteJid, {
-                    react: {
-                        text: '❌',
-                        key: msg.key,
-                    },
-                })
-        console.error('[ERROR] Gagal menampilkan menu:', error)
+        // React gagal
         await wa.sendMessage(msg.key.remoteJid, {
-            text: '❌ Terjadi kesalahan saat menampilkan menu.',
-        }, { quoted: msg })
+            react: {
+                text: '❌',
+                key: msg.key,
+            },
+        })
+        console.error('[ERROR] Gagal menampilkan menu:', error)
+        await wa.sendMessage(
+            msg.key.remoteJid,
+            {
+                text: '❌ Terjadi kesalahan saat menampilkan menu.',
+            },
+            { quoted: msg },
+        )
     }
 }
 
@@ -1493,13 +1655,13 @@ const handleReportCommand = async (wa, msg) => {
                 },
                 { quoted: msg },
             )
-                 // React sukses
-                await wa.sendMessage(msg.key.remoteJid, {
-                    react: {
-                        text: '✅',
-                        key: msg.key,
-                    },
-                })
+            // React sukses
+            await wa.sendMessage(msg.key.remoteJid, {
+                react: {
+                    text: '✅',
+                    key: msg.key,
+                },
+            })
 
             console.log('==============================================')
             console.log('[SUCCESS] Laporan berhasil terkirim!')
@@ -1517,13 +1679,13 @@ const handleReportCommand = async (wa, msg) => {
                 { text: '❌ Maaf, terjadi kesalahan saat mengambil laporan.' },
                 { quoted: msg },
             )
-                 // React gagal
-                await wa.sendMessage(msg.key.remoteJid, {
-                    react: {
-                        text: '❌',
-                        key: msg.key,
-                    },
-                })
+            // React gagal
+            await wa.sendMessage(msg.key.remoteJid, {
+                react: {
+                    text: '❌',
+                    key: msg.key,
+                },
+            })
         }
     } catch (error) {
         console.log('==============================================')
@@ -1585,7 +1747,7 @@ const handleBillingCommand = async (wa, msg) => {
         // Format: /billing [bulan] [tahun]
         // Example: /billing februari 2026
         // Example: /billing 2 2026
-        
+
         if (commandParts.length >= 2) {
             // Check if first parameter is month name or number
             if (MONTH_MAP[commandParts[1]]) {
@@ -1600,8 +1762,8 @@ const handleBillingCommand = async (wa, msg) => {
                 } else {
                     await wa.sendMessage(
                         msg.key.remoteJid,
-                        { 
-                            text: '❌ Format salah.\n\nGunakan:\n/billing [bulan] [tahun]\n\nContoh:\n/billing februari 2026\n/billing 2 2026\n/billing februari\n\nNama bulan: januari, februari, maret, dst.' 
+                        {
+                            text: '❌ Format salah.\n\nGunakan:\n/billing [bulan] [tahun]\n\nContoh:\n/billing februari 2026\n/billing 2 2026\n/billing februari\n\nNama bulan: januari, februari, maret, dst.',
                         },
                         { quoted: msg },
                     )
@@ -1618,8 +1780,8 @@ const handleBillingCommand = async (wa, msg) => {
             } else {
                 await wa.sendMessage(
                     msg.key.remoteJid,
-                    { 
-                        text: '❌ Tahun tidak valid.\n\nGunakan tahun antara 2000-2100.\n\nContoh:\n/billing februari 2026' 
+                    {
+                        text: '❌ Tahun tidak valid.\n\nGunakan tahun antara 2000-2100.\n\nContoh:\n/billing februari 2026',
                     },
                     { quoted: msg },
                 )
@@ -1677,13 +1839,13 @@ const handleBillingCommand = async (wa, msg) => {
                 },
                 { quoted: msg },
             )
-     // React sukses
-                await wa.sendMessage(msg.key.remoteJid, {
-                    react: {
-                        text: '✅',
-                        key: msg.key,
-                    },
-                })
+            // React sukses
+            await wa.sendMessage(msg.key.remoteJid, {
+                react: {
+                    text: '✅',
+                    key: msg.key,
+                },
+            })
             console.log('==============================================')
             console.log('[SUCCESS] Billing berhasil terkirim!')
             console.log('[INFO] File   :', filename)
@@ -1700,13 +1862,13 @@ const handleBillingCommand = async (wa, msg) => {
                 { text: '❌ Maaf, terjadi kesalahan saat mengambil laporan billing.' },
                 { quoted: msg },
             )
-                 // React gagal
-                await wa.sendMessage(msg.key.remoteJid, {
-                    react: {
-                        text: '❌',
-                        key: msg.key,
-                    },
-                })
+            // React gagal
+            await wa.sendMessage(msg.key.remoteJid, {
+                react: {
+                    text: '❌',
+                    key: msg.key,
+                },
+            })
         }
     } catch (error) {
         console.log('==============================================')
@@ -2036,7 +2198,7 @@ const handleTodayCommand = async (wa, msg) => {
                     `💡 Gunakan #jurnal untuk menginput jurnal.`
 
                 await wa.sendMessage(msg.key.remoteJid, { text: noDataMessage }, { quoted: msg })
-     // React sukses
+                // React sukses
                 await wa.sendMessage(msg.key.remoteJid, {
                     react: {
                         text: '✅',
@@ -2087,13 +2249,13 @@ const handleTodayCommand = async (wa, msg) => {
                 { text: '❌ Maaf, terjadi kesalahan saat mengambil data jurnal hari ini.' },
                 { quoted: msg },
             )
-                 // React gagal
-                await wa.sendMessage(msg.key.remoteJid, {
-                    react: {
-                        text: '❌',
-                        key: msg.key,
-                    },
-                })
+            // React gagal
+            await wa.sendMessage(msg.key.remoteJid, {
+                react: {
+                    text: '❌',
+                    key: msg.key,
+                },
+            })
         }
     } catch (error) {
         console.log('==============================================')
@@ -2121,13 +2283,13 @@ const handleTodayCommand = async (wa, msg) => {
                 { text: '❌ Maaf, terjadi kesalahan saat memproses permintaan jurnal hari ini.' },
                 { quoted: msg },
             )
-                 // React gagal
-                await wa.sendMessage(msg.key.remoteJid, {
-                    react: {
-                        text: '❌',
-                        key: msg.key,
-                    },
-                })
+            // React gagal
+            await wa.sendMessage(msg.key.remoteJid, {
+                react: {
+                    text: '❌',
+                    key: msg.key,
+                },
+            })
         } catch (sendErr) {
             console.log('[ERROR] Gagal mengirim pesan error ke WhatsApp:', sendErr.message)
         }
@@ -2144,4 +2306,5 @@ export {
     handleRankCommand,
     mapAliasKelas,
     isAuthorized,
+    SENDER_UNRESOLVED,
 }

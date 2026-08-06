@@ -5,7 +5,8 @@
     "main": "app.js",
     "type": "module",
     "scripts": {
-        "start": "node ."
+        "start": "node .",
+        "test": "node --test"
     },
     "repository": {
         "type": "git",

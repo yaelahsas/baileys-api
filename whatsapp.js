@@ -1,9 +1,9 @@
 /**
  * WhatsApp Bot Main Module
- * 
+ *
  * This is the main entry point for the WhatsApp bot application.
  * It orchestrates all the modular components and provides a unified API.
- * 
+ *
  * Architecture:
  * - Session Manager: Handles session lifecycle and management
  * - Message Handler: Processes incoming and outgoing messages
@@ -64,32 +64,16 @@ import {
     handleReportCommand,
     mapAliasKelas,
     isAuthorized,
+    SENDER_UNRESOLVED,
 } from './src/modules/commandHandler.js'
 
-import {
-    webhook,
-    callWebhook,
-    setupEventListeners,
-} from './src/modules/webhookHandler.js'
+import { webhook, callWebhook, setupEventListeners } from './src/modules/webhookHandler.js'
 
-import {
-    formatPhone,
-    formatGroup,
-} from './src/utils/formatters.js'
+import { formatPhone, formatGroup } from './src/utils/formatters.js'
 
-import {
-    info,
-    success,
-    error,
-    warning,
-    debug,
-    incoming,
-    outgoing,
-    event,
-    separator,
-} from './src/utils/logger.js'
+import { info, success, error, warning, debug, incoming, outgoing, event, separator } from './src/utils/logger.js'
 
-import { getAggregateVotesInPollMessage, WAMessageStatus } from 'baileys'
+import { getAggregateVotesInPollMessage, WAMessageStatus, delay } from 'baileys'
 import proto from 'baileys'
 
 /**
@@ -105,10 +89,68 @@ const BOT_START_TIME = Math.floor(Date.now() / 1000)
  */
 const setupSessions = new Set()
 
+// Track sender-unresolved retries per message to avoid infinite loops.
+// Maps `sessionId:remoteJid:id` -> attempt count.
+const senderRetryCount = new Map()
+const SENDER_RETRY_MAX = 3
+const SENDER_RETRY_DELAY = 3000 // ms
+
+/**
+ * Retry processing a group image message whose sender could not be resolved on the
+ * first upsert. Baileys often populates key.participant shortly after delivery, so a
+ * short delayed retry lets the same message succeed instead of showing an error.
+ *
+ * @param {string} sessionId - The session ID
+ * @param {import('baileys').AnyWASocket} wa - The WhatsApp session
+ * @param {object} msg - The message object to retry
+ * @returns {Promise<void>}
+ */
+const retrySenderUnresolved = async (sessionId, wa, msg) => {
+    const jid = msg?.key?.remoteJid
+    const messageId = msg?.key?.id
+    if (!jid || !messageId) return
+
+    const key = `${sessionId}:${jid}:${messageId}`
+    const attempts = (senderRetryCount.get(key) || 0) + 1
+
+    if (attempts > SENDER_RETRY_MAX) {
+        senderRetryCount.delete(key)
+        warning('WhatsApp', 'Sender still unresolved after max retries, dropping', {
+            sessionId,
+            messageId,
+            attempts: SENDER_RETRY_MAX,
+        })
+        return
+    }
+
+    senderRetryCount.set(key, attempts)
+
+    warning('WhatsApp', 'Sender unidentified on first upsert, scheduling retry', {
+        sessionId,
+        messageId,
+        retryAttempt: attempts,
+        delayMs: SENDER_RETRY_DELAY,
+    })
+
+    await delay(SENDER_RETRY_DELAY)
+
+    // Always re-fetch the latest session in case of reconnection
+    const currentWa = sessionManager.getSession(sessionId) || wa
+    const result = await handleGroupImageMessage(currentWa, msg, sessionId)
+
+    if (result !== SENDER_UNRESOLVED) {
+        // Processed (success or permanent error) - clean up the counter
+        senderRetryCount.delete(key)
+    } else {
+        // Still unresolved - retry again
+        await retrySenderUnresolved(sessionId, currentWa, msg)
+    }
+}
+
 /**
  * Message upsert handler
  * Processes incoming messages and routes them to appropriate handlers
- * 
+ *
  * @param {object} m - Message upsert event object
  * @param {string} sessionId - The session ID
  * @param {import('baileys').AnyWASocket} wa - The WhatsApp session
@@ -203,12 +245,20 @@ const handleMessageUpsert = async (m, sessionId, wa, store) => {
                 // Caption langsung format like "8K ips" should reach handleGroupImageMessage's
                 // "Mode CAPTION LANGSUNG" branch for parsing kelas + materi
                 if (typeMessage === 'imageMessage') {
-                    debug('WhatsApp', 'Image message in group (no command match), processing via handleGroupImageMessage', {
-                        sessionId,
-                        groupId: msg.key.remoteJid,
-                        hasCaption: !!msg.message.imageMessage?.caption,
-                    })
-                    await handleGroupImageMessage(currentWa, msg, sessionId)
+                    debug(
+                        'WhatsApp',
+                        'Image message in group (no command match), processing via handleGroupImageMessage',
+                        {
+                            sessionId,
+                            groupId: msg.key.remoteJid,
+                            hasCaption: !!msg.message.imageMessage?.caption,
+                        },
+                    )
+                    const imageResult = await handleGroupImageMessage(currentWa, msg, sessionId)
+                    if (imageResult === SENDER_UNRESOLVED) {
+                        // Sender could not be resolved on first upsert — schedule a retry instead of failing
+                        await retrySenderUnresolved(sessionId, currentWa, msg)
+                    }
                     messageTmp.push(msg)
                     continue
                 }
@@ -219,7 +269,7 @@ const handleMessageUpsert = async (m, sessionId, wa, store) => {
                 })
             }
 
-                // Process media for webhook if enabled
+            // Process media for webhook if enabled
             if (
                 ['documentMessage', 'imageMessage', 'videoMessage', 'audioMessage'].includes(typeMessage) &&
                 process.env.APP_WEBHOOK_FILE_IN_BASE64 === 'true'
@@ -233,7 +283,6 @@ const handleMessageUpsert = async (m, sessionId, wa, store) => {
                 messageId: msg.key.id,
             })
             messageTmp.push(msg)
-
         } catch (err) {
             error('WhatsApp', 'Failed to process message', {
                 sessionId,
@@ -251,17 +300,19 @@ const handleMessageUpsert = async (m, sessionId, wa, store) => {
 
     // Send incoming messages to webhook
     callWebhook(sessionId, 'MESSAGES_UPSERT', messageTmp)
-    
+
     // Log incoming messages for visibility
     if (messageTmp.length > 0) {
         incoming('WhatsApp', `Received ${messageTmp.length} new message(s)`, {
             sessionId,
-            messages: messageTmp.filter(msg => msg && msg.key).map(msg => ({
-                id: msg.key?.id,
-                from: msg.key?.remoteJid,
-                type: Object.keys(msg.message || {})[0],
-                timestamp: msg.messageTimestamp
-            }))
+            messages: messageTmp
+                .filter((msg) => msg && msg.key)
+                .map((msg) => ({
+                    id: msg.key?.id,
+                    from: msg.key?.remoteJid,
+                    type: Object.keys(msg.message || {})[0],
+                    timestamp: msg.messageTimestamp,
+                })),
         })
     }
 }
@@ -270,7 +321,7 @@ const handleMessageUpsert = async (m, sessionId, wa, store) => {
  * Connection update handler
  * Handles connection state changes and reconnection logic
  * Re-registers event listeners after successful reconnection
- * 
+ *
  * @param {object} update - Connection update object
  * @param {string} sessionId - The session ID
  * @param {import('baileys').AnyWASocket} wa - The WhatsApp session
@@ -309,19 +360,22 @@ const handleConnectionUpdate = async (update, sessionId, wa, store) => {
         info('WhatsApp', 'Processing pending journal queue on connection open', {
             sessionId,
         })
-        journalQueue.processPendingBySession(sessionId).then((result) => {
-            if (result.processed > 0) {
-                success('WhatsApp', 'Pending journals processed', {
-                    sessionId,
-                    ...result,
-                })
-            }
-        }).catch((err) => {
-            error('WhatsApp', 'Failed to process pending journal queue', {
-                sessionId,
-                error: err.message,
+        journalQueue
+            .processPendingBySession(sessionId)
+            .then((result) => {
+                if (result.processed > 0) {
+                    success('WhatsApp', 'Pending journals processed', {
+                        sessionId,
+                        ...result,
+                    })
+                }
             })
-        })
+            .catch((err) => {
+                error('WhatsApp', 'Failed to process pending journal queue', {
+                    sessionId,
+                    error: err.message,
+                })
+            })
     }
 
     if (connection === 'close') {
@@ -356,10 +410,10 @@ const registerSessionHandlers = (sessionId, wa) => {
         })
 
         for (const { key, update } of m) {
-            const getMessage = (key) => {
+            const getMessage = async (key) => {
                 if (wa.store) {
-                    const msg = wa.store.loadMessages(key.remoteJid, key.id)
-                    return msg?.message || undefined
+                    const messages = await wa.store.loadMessages(key.remoteJid, key.id)
+                    return messages?.[0]?.message || undefined
                 }
                 return proto.Message.fromObject({})
             }
@@ -393,10 +447,10 @@ const registerSessionHandlers = (sessionId, wa) => {
             receiptCount: m.length,
         })
 
-        const getMessage = (key) => {
+        const getMessage = async (key) => {
             if (wa.store) {
-                const msg = wa.store.loadMessages(key.remoteJid, key.id)
-                return msg?.message || undefined
+                const messages = await wa.store.loadMessages(key.remoteJid, key.id)
+                return messages?.[0]?.message || undefined
             }
             return proto.Message.fromObject({})
         }
@@ -424,20 +478,31 @@ const registerSessionHandlers = (sessionId, wa) => {
     // Setup additional event listeners (webhook events)
     // Remove existing webhook listeners first to prevent duplicates
     const webhookEvents = [
-        'chats.set', 'chats.upsert', 'chats.delete', 'chats.update',
-        'labels.association', 'labels.edit',
-        'messages.delete', 'messages.reaction', 'messages.media-update',
+        'chats.set',
+        'chats.upsert',
+        'chats.delete',
+        'chats.update',
+        'labels.association',
+        'labels.edit',
+        'messages.delete',
+        'messages.reaction',
+        'messages.media-update',
         'messaging-history.set',
-        'groups.upsert', 'groups.update', 'group-participants.update',
-        'blocklist.set', 'blocklist.update',
-        'contacts.set', 'contacts.upsert', 'contacts.update',
+        'groups.upsert',
+        'groups.update',
+        'group-participants.update',
+        'blocklist.set',
+        'blocklist.update',
+        'contacts.set',
+        'contacts.upsert',
+        'contacts.update',
         'presence.update',
     ]
-    
+
     for (const eventName of webhookEvents) {
         wa.ev.removeAllListeners(eventName)
     }
-    
+
     setupEventListeners(wa, sessionId, (instance, type, data) => callWebhook(instance, type, data))
 
     debug('WhatsApp', 'All session handlers registered', {
@@ -455,11 +520,7 @@ const registerSessionHandlers = (sessionId, wa) => {
  * @param {string} options.phoneNumber - Phone number for pairing code
  * @returns {Promise<import('baileys').AnyWASocket>} The created session
  */
-const createSession = async (
-    sessionId,
-    res = null,
-    options = { usePairingCode: false, phoneNumber: '' }
-) => {
+const createSession = async (sessionId, res = null, options = { usePairingCode: false, phoneNumber: '' }) => {
     info('WhatsApp', 'Creating new session with handlers', {
         sessionId,
         usePairingCode: options.usePairingCode,
@@ -487,7 +548,7 @@ const createSession = async (
         options,
         onMessageUpsert,
         onConnectionUpdate,
-        onWebhook
+        onWebhook,
     )
 
     // Register all session handlers
@@ -531,13 +592,9 @@ const init = () => {
 
     // Pass null callbacks to sessionManager.init() - they will be set up properly
     // in the setTimeout below after sessions are restored
-    sessionManager.init(
-        null,
-        null,
-        (instance, type, data) => {
-            callWebhook(instance, type, data)
-        }
-    )
+    sessionManager.init(null, null, (instance, type, data) => {
+        callWebhook(instance, type, data)
+    })
 
     // After sessions are restored, we need to set up proper handlers for each session
     setTimeout(() => {
@@ -546,7 +603,7 @@ const init = () => {
             sessionCount: sessionIds.length,
         })
 
-        sessionIds.forEach(sessionId => {
+        sessionIds.forEach((sessionId) => {
             const wa = sessionManager.getSession(sessionId)
             if (wa) {
                 // Create proper callbacks that always get the latest session reference
