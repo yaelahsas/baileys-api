@@ -470,7 +470,7 @@ const handleGroupCommands = async (wa, msg, sessionId) => {
 
         success('CommandHandler', 'Access granted', {
             sessionId,
-            sender,
+            sender: senderJid,
         })
 
         switch (cmd) {
