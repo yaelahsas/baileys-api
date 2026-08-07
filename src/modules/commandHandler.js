@@ -207,7 +207,8 @@ const extractPhoneNumber = (jid) => {
     if (!jid) return ''
     // Split at @ and take the first part (the number)
     // s.whatsapp.net = personal number, g.us = group ID, lid = linked ID
-    return jid.split('@')[0]
+    // Strip device suffix (:0) from multi-device linked JIDs (e.g. 62812:0@s.whatsapp.net)
+    return jid.split('@')[0].split(':')[0]
 }
 
 /**
