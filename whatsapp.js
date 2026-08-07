@@ -75,6 +75,7 @@ import { info, success, error, warning, debug, incoming, outgoing, event, separa
 
 import { getAggregateVotesInPollMessage, WAMessageStatus, delay } from 'baileys'
 import proto from 'baileys'
+import { getSessionQueue } from './src/modules/sessionQueue.js'
 
 /**
  * Bot start time for uptime tracking
@@ -317,6 +318,15 @@ const handleMessageUpsert = async (m, sessionId, wa, store) => {
     }
 }
 
+const enqueueMessageUpsert = (m, sessionId, wa, store) => {
+    getSessionQueue(sessionId).enqueue(() => handleMessageUpsert(m, sessionId, wa, store)).catch((err) => {
+        error('WhatsApp', 'Queued messages.upsert processing failed', {
+            sessionId,
+            error: err.message,
+        })
+    })
+}
+
 /**
  * Connection update handler
  * Handles connection state changes and reconnection logic
@@ -400,7 +410,7 @@ const registerSessionHandlers = (sessionId, wa) => {
     wa.ev.removeAllListeners('messages.upsert')
 
     // Re-register messages.upsert handler (critical for message detection)
-    wa.ev.on('messages.upsert', (m) => handleMessageUpsert(m, sessionId, wa, wa.store))
+    wa.ev.on('messages.upsert', (m) => enqueueMessageUpsert(m, sessionId, wa, wa.store))
 
     // Setup messages.update handler
     wa.ev.on('messages.update', async (m) => {
@@ -531,7 +541,7 @@ const createSession = async (sessionId, res = null, options = { usePairingCode: 
     // These callbacks use sessionManager.getSession() internally to avoid stale references
     const onMessageUpsert = (m) => {
         const currentWa = sessionManager.getSession(sessionId)
-        handleMessageUpsert(m, sessionId, currentWa, currentWa?.store)
+        enqueueMessageUpsert(m, sessionId, currentWa, currentWa?.store)
     }
     const onConnectionUpdate = (update) => {
         const currentWa = sessionManager.getSession(sessionId)
@@ -609,7 +619,7 @@ const init = () => {
                 // Create proper callbacks that always get the latest session reference
                 const onMessageUpsert = (m) => {
                     const currentWa = sessionManager.getSession(sessionId)
-                    handleMessageUpsert(m, sessionId, currentWa, currentWa?.store)
+                    enqueueMessageUpsert(m, sessionId, currentWa, currentWa?.store)
                 }
                 const onConnectionUpdate = (update) => {
                     const currentWa = sessionManager.getSession(sessionId)

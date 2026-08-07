@@ -494,12 +494,10 @@ class ConcurrentStore extends EventEmitter {
         let added = 0
 
         for (const msg of chatMessages) {
-            if (!existingMessages.has(msg.key.id)) {
-                existingMessages.set(msg.key.id, {
-                    ...msg,
-                    timestamp: Date.now(),
-                    indexed: true,
-                })
+            const existing = existingMessages.get(msg.key.id)
+            existingMessages.set(msg.key.id, this.mergeMessage(existing, msg))
+
+            if (!existing) {
                 added++
             }
         }
@@ -653,6 +651,20 @@ class ConcurrentStore extends EventEmitter {
     }
 
     // **Auxiliary methods**
+    mergeMessage(existing, message) {
+        return {
+            ...(existing || {}),
+            ...message,
+            key: {
+                ...(existing?.key || {}),
+                ...(message.key || {}),
+            },
+            message: message.message ?? existing?.message,
+            timestamp: Date.now(),
+            indexed: true,
+        }
+    }
+
     async addMessage(jid, message) {
         if (message.fromMe) {
             if (message?.message?.protocolMessage?.historySyncNotification) {
@@ -667,11 +679,8 @@ class ConcurrentStore extends EventEmitter {
         }
 
         const chatMessages = this.messages.get(normalizedJid)
-        chatMessages.set(message.key.id, {
-            ...message,
-            timestamp: Date.now(),
-            indexed: true,
-        })
+        const existing = chatMessages.get(message.key.id)
+        chatMessages.set(message.key.id, this.mergeMessage(existing, message))
 
         if (chatMessages.size > this.config.maxMessagesPerChat) {
             const sortedMessages = Array.from(chatMessages.entries()).sort(
@@ -682,7 +691,9 @@ class ConcurrentStore extends EventEmitter {
             toDelete.forEach(([id]) => chatMessages.delete(id))
         }
 
-        this.stats.totalMessages++
+        if (!existing) {
+            this.stats.totalMessages++
+        }
         this.stats.operations++
 
         if (!this.isProcessingHistory) {

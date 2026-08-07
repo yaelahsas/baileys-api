@@ -251,13 +251,85 @@ const selfSenderLid = (msg) => {
 }
 
 /**
+ * Resolve a LID JID (e.g. `123456789@lid`) to a phone-number JID (e.g.
+ * `62812...@s.whatsapp.net`).
+ *
+ * Priority path:
+ * 1. Baileys socket's on-wire LID mapping resolver, if reachable (`wa.signalRepository`).
+ *    This is the "official" mapping performed by Baileys during handling.
+ * 2. Reverse lookup in the session store's contacts map, which stores
+ *    `contact.lid` -> `contact.id` pairs (available even when the socket's
+ *    private resolver is not exposed).
+ *
+ * Returns the resolved JID, or the input unchanged when no mapping is known.
+ *
+ * @param {import('baileys').AnyWASocket} wa - The WhatsApp session
+ * @param {string} jid - The JID to resolve
+ * @returns {Promise<string>} The JID with a @s.whatsapp.net number encoded, or the input if unknown
+ */
+const resolveLidToPn = async (wa, jid = '') => {
+    if (!jid || !jid.endsWith('@lid')) return jid
+
+    try {
+        // Official path: reuse Baileys' internal signal LID mapping if exposed on the socket.
+        const lidMapping = wa?.signalRepository?.lidMapping
+        if (lidMapping && typeof lidMapping.getPNForLID === 'function') {
+            const pn = await lidMapping.getPNForLID(jid)
+            if (pn) return pn
+        }
+    } catch (err) {
+        warning('CommandHandler', 'Baileys LID mapping resolver failed, falling back to store', {
+            lid: jid,
+            error: err.message,
+        })
+    }
+
+    try {
+        const contacts = wa?.store?.contacts
+        if (contacts) {
+            for (const [jidKey, contact] of contacts) {
+                if (contact?.lid === jid) {
+                    const pn = contact.id || jidKey
+                    return pn.endsWith('@lid') ? pn : `${pn.split('@')[0]}@s.whatsapp.net`
+                }
+            }
+        }
+    } catch (err) {
+        warning('CommandHandler', 'Store LID-to-PN resolution failed', {
+            lid: jid,
+            error: err.message,
+        })
+    }
+
+    return jid
+}
+
+/**
+ * Normalize a sender JID (which may be a phone-number JID, `@lid` JID, or
+ * plain number) to a clean phone-number string.
+ *
+ * Chain: resolve `@lid` → PN via official/store resolver, then `extractPhoneNumber`.
+ *
+ * @param {import('baileys').AnyWASocket} wa - The WhatsApp session
+ * @param {string} senderJid - Raw sender JID (e.g. `62812@s.whatsapp.net` or `123@lid` or `62812`)
+ * @returns {Promise<string>} Clean phone number string
+ */
+const normalizeLidNumber = async (wa, senderJid = '') => {
+    if (!senderJid) return ''
+    const resolved = await resolveLidToPn(wa, senderJid)
+    return extractPhoneNumber(resolved)
+}
+
+/**
  * Resolve the sender's LID by looking up the message in the session store.
  * Baileys may deliver a live message with key.participant undefined on the first
  * upsert, but the store can hold the fully-populated message once processed.
+ * The returned value is re-resolved through the LID→PN mapping when the stored
+ * participant is a `@lid` JID.
  *
  * @param {import('baileys').AnyWASocket} wa - The WhatsApp session
  * @param {object} msg - The message object
- * @returns {string} The resolved LID, or empty string if it cannot be determined
+ * @returns {Promise<string>} The resolved phone number (LID), or empty string if it cannot be determined
  */
 const resolveSenderFromStore = async (wa, msg = {}) => {
     const jid = msg?.key?.remoteJid
@@ -265,12 +337,18 @@ const resolveSenderFromStore = async (wa, msg = {}) => {
     if (!jid || !messageId || !wa?.store) return ''
 
     try {
+        // Refetch the latest object from store: it may have been merged (Task 5)
+        // with key.participant populated after the first upsert had it undefined.
         const stored = await wa.store.loadMessages(jid, messageId)
         if (stored && stored.length > 0) {
             const key = stored[0]?.key || {}
-            if (key.participant) return extractPhoneNumber(key.participant)
-            if (key.participantAlt) return extractPhoneNumber(key.participantAlt)
-            if (key.fromMe && key.remoteJid) return extractPhoneNumber(key.remoteJid)
+            const candidates = [key.participant, key.participantAlt, key.fromMe && key.remoteJid ? key.remoteJid : '']
+            for (const candidate of candidates) {
+                if (!candidate) continue
+                const resolved = await resolveLidToPn(wa, candidate)
+                const number = extractPhoneNumber(resolved)
+                if (number) return number
+            }
         }
     } catch (err) {
         warning('CommandHandler', 'Store-based sender resolution failed', {
@@ -342,42 +420,43 @@ const handleGroupCommands = async (wa, msg, sessionId) => {
 
         // Authorization check - use participant (actual sender) not remoteJid (group ID)
         // Use the same robust sender resolution as handleGroupImageMessage
-        let sender = msg.key.participant
-        if (!sender && msg.message?.extendedTextMessage?.contextInfo?.participant) {
-            sender = msg.message.extendedTextMessage.contextInfo.participant
+        let senderJid = msg.key.participant
+        if (!senderJid && msg.message?.extendedTextMessage?.contextInfo?.participant) {
+            senderJid = msg.message.extendedTextMessage.contextInfo.participant
         }
-        if (!sender && msg.message?.imageMessage?.contextInfo?.participant) {
-            sender = msg.message.imageMessage.contextInfo.participant
+        if (!senderJid && msg.message?.imageMessage?.contextInfo?.participant) {
+            senderJid = msg.message.imageMessage.contextInfo.participant
         }
-        if (!sender && msg.message?.videoMessage?.contextInfo?.participant) {
-            sender = msg.message.videoMessage.contextInfo.participant
+        if (!senderJid && msg.message?.videoMessage?.contextInfo?.participant) {
+            senderJid = msg.message.videoMessage.contextInfo.participant
         }
-        if (!sender && msg.message?.documentMessage?.contextInfo?.participant) {
-            sender = msg.message.documentMessage.contextInfo.participant
+        if (!senderJid && msg.message?.documentMessage?.contextInfo?.participant) {
+            senderJid = msg.message.documentMessage.contextInfo.participant
         }
-        if (!sender) sender = msg.key.participantAlt
-        if (!sender && thisMessageIsFromSelf(msg)) {
-            sender = selfSenderLid(msg)
+        if (!senderJid) senderJid = msg.key.participantAlt
+        if (!senderJid && thisMessageIsFromSelf(msg)) {
+            senderJid = selfSenderLid(msg)
         }
-        if (!sender && isPersonalJid(msg.key.remoteJid)) {
-            sender = msg.key.remoteJid
+        if (!senderJid && isPersonalJid(msg.key.remoteJid)) {
+            senderJid = msg.key.remoteJid
         }
-        if (!sender) {
+        if (!senderJid) {
             // Store-based fallback
-            sender = (await resolveSenderFromStore(wa, msg)) || msg.key.remoteJid
+            senderJid = (await resolveSenderFromStore(wa, msg)) || msg.key.remoteJid
         }
-        const phoneNumber = extractPhoneNumber(sender)
+        // Normalize through LID→PN resolver for authorization check
+        const phoneNumber = await normalizeLidNumber(wa, senderJid)
 
         debug('CommandHandler', 'Authorization check', {
             sessionId,
-            sender,
+            sender: senderJid,
             phoneNumber,
         })
 
-        if (!isAuthorized(sender)) {
+        if (!isAuthorized(phoneNumber)) {
             warning('CommandHandler', 'Access denied for number', {
                 sessionId,
-                sender,
+                sender: senderJid,
                 phoneNumber,
             })
 
@@ -893,30 +972,30 @@ const handleGroupImageMessage = async (
         // contextInfo.participant (media messages) and store-based lookup.
         try {
             if (customLid) {
-                lid = customLid
+                lid = await normalizeLidNumber(wa, customLid)
                 console.log('[INFO] Mode CUSTOM LID - LID dari @mention:', lid)
             } else if (msg.message?.extendedTextMessage?.contextInfo?.participant) {
                 const quotedParticipant = msg.message.extendedTextMessage.contextInfo.participant
-                lid = extractPhoneNumber(quotedParticipant)
+                lid = await normalizeLidNumber(wa, quotedParticipant)
                 console.log('[INFO] Mode QUOTE - LID dari quoted participant:', lid)
             } else if (msg.message?.imageMessage?.contextInfo?.participant) {
                 // Direct image message: sender is in imageMessage.contextInfo.participant
-                lid = extractPhoneNumber(msg.message.imageMessage.contextInfo.participant)
+                lid = await normalizeLidNumber(wa, msg.message.imageMessage.contextInfo.participant)
                 console.log('[INFO] Mode IMAGE_CONTEXT - LID dari imageMessage.contextInfo.participant:', lid)
             } else if (msg.message?.videoMessage?.contextInfo?.participant) {
-                lid = extractPhoneNumber(msg.message.videoMessage.contextInfo.participant)
+                lid = await normalizeLidNumber(wa, msg.message.videoMessage.contextInfo.participant)
                 console.log('[INFO] Mode VIDEO_CONTEXT - LID dari videoMessage.contextInfo.participant:', lid)
             } else if (msg.message?.documentMessage?.contextInfo?.participant) {
-                lid = extractPhoneNumber(msg.message.documentMessage.contextInfo.participant)
+                lid = await normalizeLidNumber(wa, msg.message.documentMessage.contextInfo.participant)
                 console.log('[INFO] Mode DOCUMENT_CONTEXT - LID dari documentMessage.contextInfo.participant:', lid)
             } else if (msg.key.participant) {
                 // msg.key.participant is the actual sender's JID in a group
                 // This is the correct field to use for sender identification in groups
-                lid = extractPhoneNumber(msg.key.participant)
+                lid = await normalizeLidNumber(wa, msg.key.participant)
                 console.log('[INFO] Mode PARTICIPANT - LID dari msg.key.participant:', lid)
             } else if (msg.key.participantAlt) {
-                // participantAlt may contain the linked device ID
-                lid = extractPhoneNumber(msg.key.participantAlt)
+                // participantAlt may contain the linked device ID (often a LID)
+                lid = await normalizeLidNumber(wa, msg.key.participantAlt)
                 console.log('[INFO] Mode PARTICIPANT_ALT - LID dari msg.key.participantAlt:', lid)
             } else if (thisMessageIsFromSelf(msg)) {
                 // Messages sent by the bot's own account carry the bot's JID in remoteJid/participant
@@ -924,7 +1003,7 @@ const handleGroupImageMessage = async (
                 console.log('[INFO] Mode SELF - LID dari pesan bot sendiri:', lid)
             } else if (isPersonalJid(msg.key.remoteJid)) {
                 // Only use remoteJid if it's a personal chat (not a group)
-                lid = extractPhoneNumber(msg.key.remoteJid)
+                lid = await normalizeLidNumber(wa, msg.key.remoteJid)
                 console.log('[INFO] Mode PERSONAL CHAT - LID dari remoteJid:', lid)
             } else {
                 // Store-based fallback: the message may already be in the session store with
@@ -1253,7 +1332,7 @@ daring 7h matematika algoritma dasar
         // === JOURNAL QUEUE SYSTEM ===
         // Step 1: Check deduplication - if this message was already sent, skip
         const messageId = msg.key.id
-        const existingEntry = journalQueue.checkMessage(messageId)
+        const existingEntry = journalQueue.checkMessage(messageId, sessionId, msg.key.remoteJid)
 
         if (existingEntry && existingEntry.status === JournalStatus.SENT) {
             console.log('[INFO] Jurnal sudah dikirim sebelumnya, skip:', messageId)
