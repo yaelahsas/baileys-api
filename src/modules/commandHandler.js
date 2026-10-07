@@ -1297,9 +1297,11 @@ const handleMenuCommand = async (wa, msg) => {
             `   Contoh: /billing februari 2026\n` +
             `   Contoh: /billing 2 2026\n` +
             `   Contoh: /billing februari\n\n` +
-            `📅 */today* - Melihat siapa yang sudah mengisi jurnal hari ini\n` +
+            `📅 */today* - Melihat siapa yang sudah mengisi jurnal\n` +
             `   Format: /today\n` +
-            `   Menampilkan daftar guru yang sudah submit jurnal hari ini\n\n` +
+            `   Format: /today [tanggal]\n` +
+            `   Contoh: /today 07-10-2026\n` +
+            `   Menampilkan daftar guru yang sudah submit jurnal\n\n` +
             `🏅 */rank* - Melihat ranking guru berdasarkan jumlah jurnal\n` +
             `   Format: /rank [bulan] [tahun]\n` +
             `   Contoh: /rank\n` +
@@ -1994,11 +1996,31 @@ const handleTodayCommand = async (wa, msg) => {
             return
         }
 
-        // Get today's date in YYYY-MM-DD format
-        const today = new Date().toISOString().split('T')[0]
+        // Parse optional date argument (DD-MM-YYYY format)
+        const commandParts = messageContent.toLowerCase().split(' ')
+        let customDate = null
+
+        if (commandParts.length >= 2) {
+            const parsedDate = parseDate(commandParts[1])
+            if (parsedDate) {
+                customDate = parsedDate
+                console.log('[INFO] Custom date detected:', customDate)
+            } else {
+                console.log('[WARN] Invalid date format:', commandParts[1])
+                await wa.sendMessage(
+                    msg.key.remoteJid,
+                    { text: '❌ Format tanggal salah. Gunakan format DD-MM-YYYY, contoh: /today 07-10-2026' },
+                    { quoted: msg },
+                )
+                return
+            }
+        }
+
+        // Get today's date in YYYY-MM-DD format (or use custom date)
+        const today = customDate || new Date().toISOString().split('T')[0]
 
         console.log('==============================================')
-        console.log('[TODAY] Memulai proses pengambilan jurnal hari ini')
+        console.log('[TODAY] Memulai proses pengambilan jurnal')
         console.log('[INFO] Tanggal:', today)
         console.log('==============================================')
 
@@ -2007,6 +2029,9 @@ const handleTodayCommand = async (wa, msg) => {
         const response = await retryApiCall(
             () =>
                 axios.get(`${API_CONFIG.base_url}/get_jurnal_today`, {
+                    params: {
+                        tanggal: today,
+                    },
                     headers: {
                         'Content-Type': 'application/json',
                         'X-API-Key': API_CONFIG.api_key,
