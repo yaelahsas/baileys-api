@@ -227,7 +227,21 @@ const extractPhoneNumber = (jid) => {
 }
 
 /**
- * Check if a JID is a personal WhatsApp number (not a group)
+ * Mask middle digits of phone number/nol_id for privacy
+ * Example: 628123456789 → 628******789
+ */
+const maskPhoneNumber = (number) => {
+    if (!number) return ''
+    const digits = number.replace(/\D/g, '')
+    if (digits.length < 6) return number
+    const first = digits.slice(0, 3)
+    const last = digits.slice(-4)
+    const masked = ''.padStart(Math.max(0, digits.length - 8), '*')
+    return `${first}${masked}${last}`
+}
+
+/**
+ * Determine if a JID is a personal WhatsApp number (not a group)
  *
  * @param {string} jid - The JID to check
  * @returns {boolean} True if it's a personal number JID
@@ -235,6 +249,58 @@ const extractPhoneNumber = (jid) => {
 const isPersonalJid = (jid) => {
     if (!jid) return false
     return jid.endsWith('@s.whatsapp.net') || jid.endsWith('@lid')
+}
+
+/**
+ * Resolve phone-number JID to LID JID using Baileys lidMapping or contacts store
+ */
+const resolvePnToLid = async (wa, pnJid = '') => {
+    if (!pnJid || !pnJid.endsWith('@s.whatsapp.net')) return pnJid
+    try {
+        const lidMapping = wa?.signalRepository?.lidMapping
+        if (lidMapping && typeof lidMapping.getLIDForPN === 'function') {
+            const lid = await lidMapping.getLIDForPN(pnJid)
+            if (lid) return lid
+        }
+    } catch (err) {
+        warning('CommandHandler', 'Baileys PN-to-LID mapping failed', { pnJid, error: err.message })
+    }
+    try {
+        const contacts = wa?.store?.contacts
+        if (contacts) {
+            for (const [jidKey, contact] of contacts) {
+                if (contact?.id === pnJid) return contact.lid || jidKey
+            }
+        }
+    } catch (err) {
+        warning('CommandHandler', 'Store PN-to-LID lookup failed', { pnJid, error: err.message })
+    }
+    return pnJid
+}
+
+/**
+ * Extract both no_lid and no_hp from a mentioned JID
+ * @param {import('baileys').AnyWASocket} wa - The WhatsApp session
+ * @param {string} mentionedJidRaw - Raw JID from contextInfo
+ * @returns {Promise<{no_lid: string, no_hp: string}>}
+ */
+const extractNolidAndPhone = async (wa, mentionedJidRaw) => {
+    if (!mentionedJidRaw) return { no_lid: '', no_hp: '' }
+    const lidKnown = mentionedJidRaw.endsWith('@lid')
+    const pnKnown = mentionedJidRaw.endsWith('@s.whatsapp.net')
+    if (lidKnown && !pnKnown) {
+        const lid = extractPhoneNumber(mentionedJidRaw)
+        const resolved = await resolveLidToPn(wa, mentionedJidRaw)
+        const phone = extractPhoneNumber(resolved)
+        return { no_lid: lid, no_hp: phone && phone !== lid ? phone : phone }
+    }
+    if (pnKnown) {
+        const phone = extractPhoneNumber(mentionedJidRaw)
+        const resolved = await resolvePnToLid(wa, mentionedJidRaw)
+        const lid = extractPhoneNumber(resolved)
+        return { no_lid: lid, no_hp: phone }
+    }
+    return { no_lid: '', no_hp: '' }
 }
 
 /**
@@ -415,18 +481,24 @@ const handleDaftarCommand = async (wa, msg, sessionId) => {
         // parts[0] = '#daftar', parts[1..] = nama / guru_id
         const args = parts.slice(1).filter((p) => !p.startsWith('@'))
 
-        // Get @mention
         const mentionedJid =
             msg.message?.extendedTextMessage?.contextInfo?.mentionedJid ||
             msg.message?.imageMessage?.contextInfo?.mentionedJid
-        const noLidBaru = mentionedJid && mentionedJid.length > 0 ? extractPhoneNumber(mentionedJid[0]) : null
-
-        if (!noLidBaru) {
+        if (!mentionedJid || mentionedJid.length === 0) {
             await wa.sendMessage(msg.key.remoteJid, {
                 text: 'Format: #daftar Nama @mention\nContoh: #daftar Budi Santoso @628123456789',
             })
             return
         }
+        const { no_lid: rawLidBaru, no_hp: rawHpBaru } = await extractNolidAndPhone(wa, mentionedJid[0])
+        if (!rawLidBaru) {
+            await wa.sendMessage(msg.key.remoteJid, {
+                text: 'Format: #daftar Nama @mention\nContoh: #daftar Budi Santoso @628123456789',
+            })
+            return
+        }
+        const noLidBaru = rawLidBaru
+        const noHpBaru = rawHpBaru || rawLidBaru
 
         // Fallback by ID: #daftar 15 @62812xxxx
         let guruId = null
@@ -466,7 +538,7 @@ const handleDaftarCommand = async (wa, msg, sessionId) => {
             if (results.length > 1) {
                 let listMsg = `Ditemukan ${results.length} guru:\n`
                 results.forEach((g, i) => {
-                    listMsg += `${i + 1}. ${g.nama} (id ${g.id}) — no_lid ${g.no_lid || '-'}\n`
+                    listMsg += `${i + 1}. ${g.nama} (id ${g.id}) — no_lid ${maskPhoneNumber(g.no_lid) || '-'}\n`
                 })
                 listMsg += `\nBalas angka 1-${results.length} atau ketik #daftar ${results[0].id} @${noLidBaru} untuk pilih langsung`
 
@@ -478,6 +550,7 @@ const handleDaftarCommand = async (wa, msg, sessionId) => {
                     type: 'list',
                     results,
                     no_lid_baru: noLidBaru,
+                    no_hp_baru: noHpBaru,
                     expiresAt: Date.now() + 5 * 60 * 1000,
                     sessionId,
                     groupJid: msg.key.remoteJid,
@@ -509,8 +582,8 @@ const handleDaftarCommand = async (wa, msg, sessionId) => {
             guruId = found.id
         }
 
-        // Normalize no_lid
         const noLidClean = noLidBaru.replace(/\D/g, '')
+        const hpClean = (noHpBaru || '').replace(/\D/g, '')
 
         // Store pending confirmation
         const senderJidRaw = msg.key.participant || msg.key.remoteJid
@@ -521,15 +594,18 @@ const handleDaftarCommand = async (wa, msg, sessionId) => {
             guru_id: parseInt(guruId),
             nama: guru.nama,
             no_lid_baru: noLidClean,
+            no_hp_baru: hpClean,
             no_lid_lama: guru.no_lid || null,
             expiresAt: Date.now() + 5 * 60 * 1000,
             sessionId,
             groupJid: msg.key.remoteJid,
         })
 
-        // Send confirmation
+        // Send confirmation with masked numbers
+        const lidMasked = maskPhoneNumber(noLidClean)
+        const hpMasked = maskPhoneNumber(hpClean)
         await wa.sendMessage(msg.key.remoteJid, {
-            text: `Konfirmasi pendaftaran:\nGuru: ${guru.nama} (id ${guruId})\nNomor baru: ${noLidClean}${guru.no_lid ? `\nNomor lama: ${guru.no_lid}` : ''}\n\nBenar? Balas ya / tidak (5 menit)`,
+            text: `Konfirmasi pendaftaran:\nGuru: ${guru.nama} (id ${guruId})\nNo. baru (tersensor): ${lidMasked}\nNo. hp (tersensor): ${hpMasked}${guru.no_lid ? `\nNo. lama: ${maskPhoneNumber(guru.no_lid)}` : ''}\n\nBenar? Balas ya / tidak (5 menit)`,
         })
     } catch (err) {
         error('CommandHandler', 'handleDaftarCommand failed', { error: err.message })
@@ -601,7 +677,7 @@ const checkDaftarConfirmation = async (wa, msg, sessionId, senderJid = '') => {
             daftarCache.set(cacheKey, pending)
 
             await wa.sendMessage(msg.key.remoteJid, {
-                text: `Konfirmasi pendaftaran:\nGuru: ${selected.nama} (id ${selected.id})\nNomor baru: ${pending.no_lid_baru}${selected.no_lid ? `\nNomor lama: ${selected.no_lid}` : ''}\n\nBenar? Balas ya / tidak (5 menit)`,
+                text: `Konfirmasi pendaftaran:\nGuru: ${selected.nama} (id ${selected.id})\nNo. baru (tersensor): ${maskPhoneNumber(pending.no_lid_baru)}\nNo. hp (tersensor): ${maskPhoneNumber(pending.no_hp_baru || '')}${selected.no_lid ? `\nNo. lama: ${maskPhoneNumber(selected.no_lid)}` : ''}\n\nBenar? Balas ya / tidak (5 menit)`,
             })
             return true
         }
@@ -615,11 +691,14 @@ const checkDaftarConfirmation = async (wa, msg, sessionId, senderJid = '') => {
 
         // ya / y
         const noLidClean = pending.no_lid_baru.replace(/\D/g, '')
+        const noHpRaw = (pending.no_hp_baru || '').replace(/\D/g, '')
+        // Fallback: bila mapping LID→PN tidak ditemukan, kirim no_lid yang sama
+        const noHpClean = noHpRaw.length >= 8 ? noHpRaw : noLidClean
 
         try {
             const res = await axios.post(
                 `${API_CONFIG.base_url}/update_guru_whatsapp`,
-                { guru_id: pending.guru_id, no_lid: noLidClean },
+                { guru_id: pending.guru_id, no_lid: noLidClean, no_hp: noHpClean },
                 {
                     headers: {
                         'Content-Type': 'application/json',
@@ -631,7 +710,7 @@ const checkDaftarConfirmation = async (wa, msg, sessionId, senderJid = '') => {
 
             if (res.data?.status === 'success') {
                 await wa.sendMessage(msg.key.remoteJid, {
-                    text: `✅ Guru ${pending.nama} berhasil didaftarkan. Nomor: ${noLidClean}`,
+                    text: `✅ Guru ${pending.nama} berhasil didaftarkan. No: ${maskPhoneNumber(noLidClean)}`,
                 })
             } else {
                 await wa.sendMessage(msg.key.remoteJid, {
