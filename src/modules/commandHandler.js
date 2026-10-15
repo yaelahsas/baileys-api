@@ -11,6 +11,7 @@
 
 import axios from 'axios'
 import { downloadMediaMessage } from 'baileys'
+import NodeCache from 'node-cache'
 import { info, success, error, warning, command, api, apiCall, report, debug, separator } from '../utils/logger.js'
 import fs from 'fs'
 import { generateVoiceNote } from '../utils/tts.js'
@@ -38,7 +39,21 @@ const AUTHORIZED_NUMBERS = process.env.AUTHORIZED_NUMBERS
  * Known commands that the bot recognizes
  * @type {Array<string>}
  */
-const KNOWN_COMMANDS = ['#laporan', '#jurnal', '#jurnal-daring', '#ekstra', '/menu', '/billing', '/today', '/rank']
+const KNOWN_COMMANDS = [
+    '#laporan',
+    '#jurnal',
+    '#jurnal-daring',
+    '#ekstra',
+    '#jurnal-tka',
+    '#jurnal-tka-daring',
+    '#daftar',
+    '/menu',
+    '/billing',
+    '/today',
+    '/today-tka',
+    '/rank',
+    '/rank-tka',
+]
 
 /**
  * Month name to number mapping for Indonesian months
@@ -374,6 +389,271 @@ const isAuthorized = (sender) => {
 }
 
 /**
+ * Pending daftar cache — stores pending #daftar confirmations.
+ * Key: `${groupJid}:${senderJid}`, Value: { guru_id, nama, no_lid_baru, no_lid_lama, expiresAt, sessionId, groupJid }
+ * TTL 5 minutes.
+ */
+/**
+ * Pending daftar cache — stores pending #daftar confirmations.
+ * Key: `${groupJid}:${senderJid}`, Value: { guru_id, nama, no_lid_baru, no_lid_lama, expiresAt, sessionId, groupJid }
+ * TTL 5 minutes.
+ */
+const daftarCache = new NodeCache({ stdTTL: 300, checkperiod: 60 })
+
+/**
+ * Handle #daftar command — register/update guru.no_lid via SIM API
+ *
+ * @param {import('baileys').AnyWASocket} wa - The WhatsApp session
+ * @param {object} msg - The message object
+ * @param {string} sessionId - The session ID
+ */
+const handleDaftarCommand = async (wa, msg, sessionId) => {
+    try {
+        const text = (msg.message.conversation || msg.message.extendedTextMessage?.text || '').trim()
+        const parts = text.split(' ').filter((p) => p.trim() !== '')
+
+        // parts[0] = '#daftar', parts[1..] = nama / guru_id
+        const args = parts.slice(1).filter((p) => !p.startsWith('@'))
+
+        // Get @mention
+        const mentionedJid =
+            msg.message?.extendedTextMessage?.contextInfo?.mentionedJid ||
+            msg.message?.imageMessage?.contextInfo?.mentionedJid
+        const noLidBaru = mentionedJid && mentionedJid.length > 0 ? extractPhoneNumber(mentionedJid[0]) : null
+
+        if (!noLidBaru) {
+            await wa.sendMessage(msg.key.remoteJid, {
+                text: 'Format: #daftar Nama @mention\nContoh: #daftar Budi Santoso @628123456789',
+            })
+            return
+        }
+
+        // Fallback by ID: #daftar 15 @62812xxxx
+        let guruId = null
+        let nama = null
+
+        if (args.length > 0 && /^\d+$/.test(args[0])) {
+            guruId = args[0]
+        } else {
+            nama = args.join(' ')
+        }
+
+        if (!guruId && (!nama || nama.length < 2)) {
+            await wa.sendMessage(msg.key.remoteJid, {
+                text: 'Format: #daftar Nama @mention\nContoh: #daftar Budi Santoso @628123456789',
+            })
+            return
+        }
+
+        // Search guru if not by ID
+        let guru = null
+        if (!guruId) {
+            const searchUrl = `${API_CONFIG.base_url}/search_guru?nama=${encodeURIComponent(nama)}`
+            const searchRes = await axios.get(searchUrl, {
+                headers: { 'X-API-Key': API_CONFIG.api_key },
+                timeout: API_CONFIG.timeout,
+            })
+
+            const results = searchRes.data?.data || []
+
+            if (results.length === 0) {
+                await wa.sendMessage(msg.key.remoteJid, {
+                    text: `Guru '${nama}' tidak ditemukan`,
+                })
+                return
+            }
+
+            if (results.length > 1) {
+                let listMsg = `Ditemukan ${results.length} guru:\n`
+                results.forEach((g, i) => {
+                    listMsg += `${i + 1}. ${g.nama} (id ${g.id}) — no_lid ${g.no_lid || '-'}\n`
+                })
+                listMsg += `\nBalas angka 1-${results.length} atau ketik #daftar ${results[0].id} @${noLidBaru} untuk pilih langsung`
+
+                // Store pending list for numeric reply
+                const senderJidRaw = msg.key.participant || msg.key.remoteJid
+                const senderJid = senderJidRaw ? await normalizeLidNumber(wa, senderJidRaw) : ''
+                const cacheKey = `${msg.key.remoteJid}:${senderJid}`
+                daftarCache.set(cacheKey, {
+                    type: 'list',
+                    results,
+                    no_lid_baru: noLidBaru,
+                    expiresAt: Date.now() + 5 * 60 * 1000,
+                    sessionId,
+                    groupJid: msg.key.remoteJid,
+                })
+
+                await wa.sendMessage(msg.key.remoteJid, { text: listMsg })
+                return
+            }
+
+            guru = results[0]
+            guruId = guru.id
+        } else {
+            // Fallback by ID: #daftar 15 @62812xxxx — fetch guru data for the confirmation display
+            const searchRes = await axios.get(`${API_CONFIG.base_url}/search_guru`, {
+                params: { id: guruId },
+                headers: { 'X-API-Key': API_CONFIG.api_key },
+                timeout: API_CONFIG.timeout,
+            })
+
+            const found = (searchRes.data?.data || [])[0]
+            if (!found) {
+                await wa.sendMessage(msg.key.remoteJid, {
+                    text: `Guru dengan id ${guruId} tidak ditemukan`,
+                })
+                return
+            }
+
+            guru = found
+            guruId = found.id
+        }
+
+        // Normalize no_lid
+        const noLidClean = noLidBaru.replace(/\D/g, '')
+
+        // Store pending confirmation
+        const senderJidRaw = msg.key.participant || msg.key.remoteJid
+        const senderJid = senderJidRaw ? await normalizeLidNumber(wa, senderJidRaw) : ''
+        const cacheKey = `${msg.key.remoteJid}:${senderJid}`
+        daftarCache.set(cacheKey, {
+            type: 'confirm',
+            guru_id: parseInt(guruId),
+            nama: guru.nama,
+            no_lid_baru: noLidClean,
+            no_lid_lama: guru.no_lid || null,
+            expiresAt: Date.now() + 5 * 60 * 1000,
+            sessionId,
+            groupJid: msg.key.remoteJid,
+        })
+
+        // Send confirmation
+        await wa.sendMessage(msg.key.remoteJid, {
+            text: `Konfirmasi pendaftaran:\nGuru: ${guru.nama} (id ${guruId})\nNomor baru: ${noLidClean}${guru.no_lid ? `\nNomor lama: ${guru.no_lid}` : ''}\n\nBenar? Balas ya / tidak (5 menit)`,
+        })
+    } catch (err) {
+        error('CommandHandler', 'handleDaftarCommand failed', { error: err.message })
+        await wa.sendMessage(msg.key.remoteJid, {
+            text: 'Terjadi kesalahan saat memproses pendaftaran.',
+        })
+    }
+}
+
+/**
+ * Check if a message is a pending daftar confirmation (ya/tidak/number)
+ * Called from handleMessageUpsert before handleGroupCommands
+ *
+ * @param {import('baileys').AnyWASocket} wa - The WhatsApp session
+ * @param {object} msg - The message object
+ * @param {string} sessionId - The session ID
+ * @returns {Promise<boolean>} True if handled as confirmation
+ */
+const checkDaftarConfirmation = async (wa, msg, sessionId, senderJid = '') => {
+    try {
+        const text = (msg.message.conversation || msg.message.extendedTextMessage?.text || '').trim().toLowerCase()
+
+        // Only process short replies
+        if (!['ya', 'tidak', 'y', 't'].includes(text) && !/^\d+$/.test(text)) {
+            return false
+        }
+
+        // Gunakan senderJid ternormalisasi (dari whatsapp.js), fallback resolve di sini
+        if (!senderJid) {
+            const rawSender = msg.key.participant || msg.key.remoteJid
+            senderJid = rawSender ? await normalizeLidNumber(wa, rawSender) : ''
+        }
+
+        // Otorisasi: hanya AUTHORIZED_NUMBERS yang boleh konfirmasi #daftar (spec §4.5)
+        if (!isAuthorized(senderJid)) {
+            return false
+        }
+
+        const cacheKey = `${msg.key.remoteJid}:${senderJid}`
+        const pending = daftarCache.get(cacheKey)
+
+        if (!pending) return false
+
+        // Check expiry
+        if (Date.now() > pending.expiresAt) {
+            daftarCache.del(cacheKey)
+            await wa.sendMessage(msg.key.remoteJid, {
+                text: 'Konfirmasi kadaluarsa, ulangi #daftar',
+            })
+            return true
+        }
+
+        // Handle numeric reply (list selection)
+        if (/^\d+$/.test(text) && pending.type === 'list') {
+            const idx = parseInt(text) - 1
+            if (idx < 0 || idx >= pending.results.length) {
+                await wa.sendMessage(msg.key.remoteJid, {
+                    text: `Pilihan tidak valid. Balas angka 1-${pending.results.length}`,
+                })
+                return true
+            }
+
+            const selected = pending.results[idx]
+            pending.type = 'confirm'
+            pending.guru_id = selected.id
+            pending.nama = selected.nama
+            pending.no_lid_lama = selected.no_lid || null
+            pending.expiresAt = Date.now() + 5 * 60 * 1000
+            daftarCache.set(cacheKey, pending)
+
+            await wa.sendMessage(msg.key.remoteJid, {
+                text: `Konfirmasi pendaftaran:\nGuru: ${selected.nama} (id ${selected.id})\nNomor baru: ${pending.no_lid_baru}${selected.no_lid ? `\nNomor lama: ${selected.no_lid}` : ''}\n\nBenar? Balas ya / tidak (5 menit)`,
+            })
+            return true
+        }
+
+        // Handle ya/tidak
+        if (text === 'tidak' || text === 't') {
+            daftarCache.del(cacheKey)
+            await wa.sendMessage(msg.key.remoteJid, { text: 'Dibatalkan.' })
+            return true
+        }
+
+        // ya / y
+        const noLidClean = pending.no_lid_baru.replace(/\D/g, '')
+
+        try {
+            const res = await axios.post(
+                `${API_CONFIG.base_url}/update_guru_whatsapp`,
+                { guru_id: pending.guru_id, no_lid: noLidClean },
+                {
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'X-API-Key': API_CONFIG.api_key,
+                    },
+                    timeout: API_CONFIG.timeout,
+                }
+            )
+
+            if (res.data?.status === 'success') {
+                await wa.sendMessage(msg.key.remoteJid, {
+                    text: `✅ Guru ${pending.nama} berhasil didaftarkan. Nomor: ${noLidClean}`,
+                })
+            } else {
+                await wa.sendMessage(msg.key.remoteJid, {
+                    text: `❌ Gagal: ${res.data?.message || 'Unknown error'}`,
+                })
+            }
+        } catch (apiErr) {
+            const errMsg = apiErr.response?.data?.message || apiErr.message
+            await wa.sendMessage(msg.key.remoteJid, {
+                text: `❌ Gagal: ${errMsg}`,
+            })
+        }
+
+        daftarCache.del(cacheKey)
+        return true
+    } catch (err) {
+        error('CommandHandler', 'checkDaftarConfirmation failed', { error: err.message })
+        return false
+    }
+}
+
+/**
  * Handle group commands
  *
  * @param {import('baileys').AnyWASocket} wa - The WhatsApp session
@@ -554,6 +834,26 @@ const handleGroupCommands = async (wa, msg, sessionId) => {
                 return true
             }
 
+            case '/today-tka': {
+                command('CommandHandler', 'Processing /today-tka command (TKA)', {
+                    sessionId,
+                })
+
+                try {
+                    await handleTodayCommand(wa, msg, 'tka')
+                    success('CommandHandler', '/today-tka command processed successfully', {
+                        sessionId,
+                    })
+                } catch (err) {
+                    error('CommandHandler', 'handleTodayCommand failed (TKA)', {
+                        sessionId,
+                        error: err.message,
+                    })
+                }
+
+                return true
+            }
+
             case '/rank': {
                 command('CommandHandler', 'Processing /rank command', {
                     sessionId,
@@ -566,6 +866,26 @@ const handleGroupCommands = async (wa, msg, sessionId) => {
                     })
                 } catch (err) {
                     error('CommandHandler', 'handleRankCommand failed', {
+                        sessionId,
+                        error: err.message,
+                    })
+                }
+
+                return true
+            }
+
+            case '/rank-tka': {
+                command('CommandHandler', 'Processing /rank-tka command (TKA)', {
+                    sessionId,
+                })
+
+                try {
+                    await handleRankCommand(wa, msg, 'tka')
+                    success('CommandHandler', '/rank-tka command processed successfully', {
+                        sessionId,
+                    })
+                } catch (err) {
+                    error('CommandHandler', 'handleRankCommand failed (TKA)', {
                         sessionId,
                         error: err.message,
                     })
@@ -913,6 +1233,134 @@ Atau untuk guru lain (tag @guru):
                 return true
             }
 
+            case '#daftar': {
+                command('CommandHandler', 'Processing #daftar command', {
+                    sessionId,
+                })
+
+                try {
+                    await handleDaftarCommand(wa, msg, sessionId)
+                    success('CommandHandler', '#daftar command processed successfully', {
+                        sessionId,
+                    })
+                } catch (err) {
+                    error('CommandHandler', 'handleDaftarCommand failed', {
+                        sessionId,
+                        error: err.message,
+                    })
+                }
+
+                return true
+            }
+
+            case '#jurnal-tka':
+            case '#jurnal-tka-daring': {
+                const isDaringTka = cmd === '#jurnal-tka-daring'
+                command('CommandHandler', `Processing ${cmd} command (TKA)`, {
+                    sessionId,
+                })
+
+                const partsTka = text.split(' ')
+                let tanggalInputTka = null
+                let customLidTka = null
+
+                // Extract custom LID from @mention
+                const mentionedJidTka =
+                    msg.message?.extendedTextMessage?.contextInfo?.mentionedJid ||
+                    msg.message?.imageMessage?.contextInfo?.mentionedJid
+                if (mentionedJidTka && mentionedJidTka.length > 0) {
+                    customLidTka = extractPhoneNumber(mentionedJidTka[0])
+                    info('CommandHandler', 'Custom LID from @mention (TKA)', {
+                        sessionId,
+                        customLid: customLidTka,
+                    })
+                }
+
+                // Parse arguments after command, skipping @mention parts
+                const argPartsTka = partsTka.slice(1).filter((p) => !p.startsWith('@'))
+
+                if (argPartsTka.length > 0) {
+                    tanggalInputTka = argPartsTka[0]
+                }
+
+                let tanggalFinalTka = null
+
+                if (tanggalInputTka) {
+                    const parsedDate = parseDate(tanggalInputTka)
+                    if (parsedDate) {
+                        tanggalFinalTka = parsedDate
+                        info('CommandHandler', 'Custom date detected for TKA', {
+                            sessionId,
+                            customDate: tanggalFinalTka,
+                        })
+                    }
+                }
+
+                // Check if there's a quoted message
+                const quotedTka = msg.message?.extendedTextMessage?.contextInfo?.quotedMessage
+
+                if (!quotedTka) {
+                    warning('CommandHandler', `${cmd} without image reply`, {
+                        sessionId,
+                    })
+
+                    await wa.sendMessage(msg.key.remoteJid, {
+                        text: `Format salah.
+
+Gunakan:
+Reply gambar dengan:
+
+${cmd} 8A matematika dasar
+
+Atau dengan tanggal:
+
+${cmd} 06-02-2026 8A matematika dasar
+
+Atau untuk guru lain (tag @guru):
+
+${cmd} @628xxx 8A matematika dasar
+${cmd} @628xxx 06-02-2026 8A matematika dasar`,
+                    })
+
+                    return true
+                }
+
+                if (!quotedTka.imageMessage) {
+                    warning('CommandHandler', `Quoted message is not an image (${cmd})`, {
+                        sessionId,
+                    })
+
+                    await wa.sendMessage(msg.key.remoteJid, {
+                        text: 'Pesan yang direply bukan gambar. Mohon reply pesan gambar.',
+                    })
+
+                    return true
+                }
+
+                try {
+                    await handleGroupImageMessage(
+                        wa,
+                        msg,
+                        sessionId,
+                        tanggalFinalTka,
+                        isDaringTka ? 'daring' : 'luring',
+                        'akademik',
+                        customLidTka,
+                        'tka',
+                    )
+                    success('CommandHandler', `${cmd} command processed successfully`, {
+                        sessionId,
+                    })
+                } catch (err) {
+                    error('CommandHandler', `handleGroupImageMessage failed (${cmd})`, {
+                        sessionId,
+                        error: err.message,
+                    })
+                }
+
+                return true
+            }
+
             default:
                 debug('CommandHandler', 'Unknown command after switch', {
                     sessionId,
@@ -944,6 +1392,7 @@ Atau untuk guru lain (tag @guru):
  * @param {string} metode - Metode pembelajaran: 'luring' (default) atau 'daring'
  * @param {string} jenis - Jenis jurnal: 'akademik' (default) atau 'non_akademik'
  * @param {string|null} customLid - Custom LID (no_lid guru) from @mention, overrides default LID detection
+ * @param {string} kategori - Kategori jurnal: 'bimbel' (default) atau 'tka'
  */
 const handleGroupImageMessage = async (
     wa,
@@ -953,6 +1402,7 @@ const handleGroupImageMessage = async (
     metode = 'luring',
     jenis = 'akademik',
     customLid = null,
+    kategori = 'bimbel',
 ) => {
     try {
         console.log('==============================================')
@@ -1155,8 +1605,51 @@ const handleGroupImageMessage = async (
         // Filter out @mention parts from text parsing (they are LID references, not content)
         const parts = text.split(' ').filter((part) => part.trim() !== '' && !part.startsWith('@'))
 
+        // Detect exact lowercase token 'tka' — this drives the TKA (auto-detected) mode
+        const lowerParts = parts.map((part) => part.toLowerCase())
+        const tkaIdx = lowerParts.indexOf('tka')
+
+        // Mode COMMAND #JURNAL-TKA / #JURNAL-TKA-DARING
+        if (parts[0].toLowerCase() === '#jurnal-tka' || parts[0].toLowerCase() === '#jurnal-tka-daring') {
+            console.log('[INFO] Mode COMMAND', parts[0], 'terdeteksi')
+
+            if (parts.length >= 2) {
+                const parsedDate = parseDate(parts[1])
+                if (parsedDate) {
+                    tanggalKirim = parsedDate
+                    kelas = parts[2] || ''
+                    materi = parts.slice(3).join(' ')
+                    console.log('[INFO] Tanggal custom (TKA):', tanggalKirim)
+                } else {
+                    kelas = parts[1] || ''
+                    materi = parts.slice(2).join(' ')
+                }
+            } else {
+                await wa.sendMessage(
+                    msg.key.remoteJid,
+                    {
+                        text: `❌ Format salah.
+
+Gunakan:
+#jurnal-tka 8A matematika dasar
+
+Atau dengan tanggal:
+#jurnal-tka 06-02-2026 8A matematika dasar
+
+Atau untuk guru lain (tag @guru):
+#jurnal-tka @628xxx 8A matematika dasar
+#jurnal-tka @628xxx 06-02-2026 8A matematika dasar
+
+Varian daring:
+#jurnal-tka-daring 8A matematika dasar`,
+                    },
+                    { quoted: msg },
+                )
+                return
+            }
+        }
         // Mode COMMAND #JURNAL
-        if (parts[0].toLowerCase() === '#jurnal') {
+        else if (parts[0].toLowerCase() === '#jurnal') {
             console.log('[INFO] Mode COMMAND #jurnal terdeteksi')
 
             if (parts.length >= 2) {
@@ -1264,13 +1757,45 @@ Atau untuk guru lain (tag @guru):
             }
         }
         // Mode CAPTION DARING (daring [kelas] [materi])
+        else if (tkaIdx !== -1) {
+            // **FITUR 2: Deteksi token 'tka' di caption langsung (termasuk "daring 8A tka ...")**
+            console.log('[INFO] Mode CAPTION TKA terdeteksi')
+
+            // Validasi: 'tka' tidak boleh di awal (tkaIdx === 0 → format salah)
+            if (tkaIdx === 0) {
+                await wa.sendMessage(
+                    msg.key.remoteJid,
+                    {
+                        text: `❌ Format jurnal salah.
+Tuliskan kelas terlebih dahulu, contoh: "8A tka matematika dasar"`,
+                    },
+                    { quoted: msg },
+                )
+                return
+            }
+
+            // Handle prefix 'daring': jika parts[0] === 'daring' dan tkaIdx > 0
+            if (parts[0].toLowerCase() === 'daring' && tkaIdx > 0) {
+                metode = 'daring'
+                kelas = parts[tkaIdx - 1]
+                materi = parts.slice(tkaIdx + 1).join(' ')
+            } else {
+                // Format standar: "kelas tka materi"
+                kelas = parts[tkaIdx - 1]
+                materi = parts.slice(tkaIdx + 1).join(' ')
+            }
+
+            // Set kategori ke TKA
+            kategori = 'tka'
+        }
+        // Mode CAPTION DARING (daring [kelas] [materi])
         else if (parts[0].toLowerCase() === 'daring') {
             console.log('[INFO] Mode CAPTION daring terdeteksi')
             metode = 'daring'
             kelas = parts[1] || ''
             materi = parts.slice(2).join(' ')
         }
-        // Mode CAPTION LANGSUNG
+        // Mode CAPTION LANGSUNG (bimbel biasa)
         else {
             kelas = parts[0] || ''
             materi = parts.slice(1).join(' ')
@@ -1329,6 +1854,7 @@ daring 7h matematika algoritma dasar
         console.log('- Tanggal:', tanggalKirim)
         console.log('- Metode :', metode)
         console.log('- Jenis  :', jenis)
+        console.log('- Kategori:', kategori)
 
         // === JOURNAL QUEUE SYSTEM ===
         // Step 1: Check deduplication - if this message was already sent, skip
@@ -1374,6 +1900,7 @@ daring 7h matematika algoritma dasar
             tanggal: tanggalKirim,
             metode: metode,
             jenis: jenis,
+            kategori: kategori,
         }
 
         const queueEntry = journalQueue.enqueue({
@@ -1386,6 +1913,7 @@ daring 7h matematika algoritma dasar
             tanggal: tanggalKirim,
             metode: metode,
             jenis: jenis,
+            kategori: kategori,
             foto: fotoData,
             keterangan: 'Jurnal via WhatsApp Bot',
         })
@@ -1404,6 +1932,9 @@ daring 7h matematika algoritma dasar
             },
         })
 
+        // Route to the correct SIM endpoint: TKA journals use /create_jurnal_tka
+        const jurnalEndpoint = kategori === 'tka' ? '/create_jurnal_tka' : '/create_jurnal'
+
         // Step 3: If entry is pending (new or retry), try to send to API immediately
         // If it fails, the entry stays as 'pending' in DB and will be retried later
         if (queueEntry.status === JournalStatus.PENDING || queueEntry.status === JournalStatus.FAILED) {
@@ -1411,7 +1942,7 @@ daring 7h matematika algoritma dasar
             try {
                 const response = await retryApiCall(
                     () =>
-                        axios.post(`${API_CONFIG.base_url}/create_jurnal`, data, {
+                        axios.post(`${API_CONFIG.base_url}${jurnalEndpoint}`, data, {
                             headers: {
                                 'Content-Type': 'application/json',
                                 'X-API-Key': API_CONFIG.api_key,
@@ -1561,7 +2092,19 @@ const handleMenuCommand = async (wa, msg) => {
             `   Untuk guru lain: #ekstra @628xxx pramuka pengenalan tali temali\n\n` +
             `📌 *Caption langsung pada gambar:*\n` +
             `   Luring/Akademik: 7h matematika algoritma dasar\n` +
-            `   Daring/Akademik: daring 7h matematika algoritma dasar\n\n` +
+            `   Daring/Akademik: daring 7h matematika algoritma dasar\n` +
+            `   TKA (kategori terpisah): 8A tka matematika dasar\n` +
+            `   TKA daring: daring 8A tka matematika dasar\n\n` +
+            `🎯 *#jurnal-tka / #jurnal-tka-daring* - Input jurnal TKA (kategori TKA, terpisah dari Bimbel)\n` +
+            `   Format: #jurnal-tka [tanggal] kelas materi (reply foto)\n` +
+            `   Contoh: #jurnal-tka 8A matematika dasar\n` +
+            `   Contoh: #jurnal-tka 06-02-2026 8A matematika dasar\n` +
+            `   Untuk guru lain: #jurnal-tka @628xxx 8A matematika dasar\n` +
+            `   Varian daring: #jurnal-tka-daring 8A matematika dasar\n\n` +
+            `📝 *#daftar* - Daftarkan nomor WA guru (hanya admin)\n` +
+            `   Format: #daftar Nama @mention\n` +
+            `   Contoh: #daftar Budi Santoso @628123456789\n` +
+            `   Balas ya / tidak untuk konfirmasi\n\n` +
             ` *Catatan:*\n` +
             `   - Gunakan format tanggal DD-MM-YYYY untuk tanggal custom\n` +
             `   - Reply gambar untuk input jurnal\n` +
@@ -1989,13 +2532,20 @@ const handleBillingCommand = async (wa, msg) => {
  *
  * @param {import('baileys').AnyWASocket} wa - The WhatsApp session
  * @param {object} msg - The message object
+ * @param {'bimbel'|'tka'} kategori - Kategori jurnal (bimbel default, tka untuk /rank-tka)
  */
-const handleRankCommand = async (wa, msg) => {
+const handleRankCommand = async (wa, msg, kategori = 'bimbel') => {
     try {
         const messageContent = msg.message.conversation || msg.message.extendedTextMessage?.text || ''
 
-        if (!messageContent.toLowerCase().startsWith('/rank')) {
-            return
+        if (kategori === 'tka') {
+            if (!messageContent.toLowerCase().startsWith('/rank-tka')) {
+                return
+            }
+        } else if (!messageContent.toLowerCase().startsWith('/rank')) {
+            // '/rank' must be exact, not '/rank-tka'
+            const firstWord = messageContent.toLowerCase().split(' ')[0]
+            if (firstWord !== '/rank') return
         }
 
         const commandParts = messageContent.toLowerCase().split(' ')
@@ -2054,7 +2604,7 @@ const handleRankCommand = async (wa, msg) => {
         }
 
         // Build URL
-        const url = `${API_CONFIG.base_url}/get_rank_jurnal?bulan=${monthNum}&tahun=${yearNum}`
+        const url = `${API_CONFIG.base_url}/${kategori === 'tka' ? '/get_rank_jurnal_tka' : '/get_rank_jurnal'}?bulan=${monthNum}&tahun=${yearNum}`
 
         console.log('==============================================')
         console.log('[RANK] Memulai proses pengambilan ranking jurnal')
@@ -2229,13 +2779,19 @@ const handleRankCommand = async (wa, msg) => {
  *
  * @param {import('baileys').AnyWASocket} wa - The WhatsApp session
  * @param {object} msg - The message object
+ * @param {'bimbel'|'tka'} kategori - Kategori jurnal (bimbel default, tka untuk /today-tka)
  */
-const handleTodayCommand = async (wa, msg) => {
+const handleTodayCommand = async (wa, msg, kategori = 'bimbel') => {
     try {
         const messageContent = msg.message.conversation || msg.message.extendedTextMessage?.text || ''
 
-        if (!messageContent.toLowerCase().startsWith('/today')) {
-            return
+        if (kategori === 'tka') {
+            if (!messageContent.toLowerCase().startsWith('/today-tka')) {
+                return
+            }
+        } else if (!messageContent.toLowerCase().startsWith('/today')) {
+            const firstWord = messageContent.toLowerCase().split(' ')[0]
+            if (firstWord !== '/today') return
         }
 
         // Parse optional date argument (DD-MM-YYYY format)
@@ -2268,9 +2824,11 @@ const handleTodayCommand = async (wa, msg) => {
 
         console.log('[STEP 1] Mengambil data jurnal dari API dengan retry logic...')
 
+        const url = `${API_CONFIG.base_url}${kategori === 'tka' ? '/get_jurnal_today_tka' : '/get_jurnal_today'}`
+
         const response = await retryApiCall(
             () =>
-                axios.get(`${API_CONFIG.base_url}/get_jurnal_today`, {
+                axios.get(url, {
                     params: {
                         tanggal: today,
                     },
@@ -2409,7 +2967,11 @@ export {
     handleBillingCommand,
     handleTodayCommand,
     handleRankCommand,
+    handleDaftarCommand,
+    checkDaftarConfirmation,
     mapAliasKelas,
     isAuthorized,
+    extractPhoneNumber,
+    normalizeLidNumber,
     SENDER_UNRESOLVED,
 }

@@ -17,6 +17,8 @@
 // Import all modules
 import * as sessionManager from './src/modules/sessionManager.js'
 import { journalQueue, JournalStatus } from './src/modules/journalQueue.js'
+import NodeCache from 'node-cache'
+import axios from 'axios'
 
 import {
     sendMessage,
@@ -65,6 +67,9 @@ import {
     mapAliasKelas,
     isAuthorized,
     SENDER_UNRESOLVED,
+    checkDaftarConfirmation,
+    extractPhoneNumber,
+    normalizeLidNumber,
 } from './src/modules/commandHandler.js'
 
 import { webhook, callWebhook, setupEventListeners } from './src/modules/webhookHandler.js'
@@ -89,6 +94,23 @@ const BOT_START_TIME = Math.floor(Date.now() / 1000)
  * @type {Set<string>}
  */
 const setupSessions = new Set()
+
+const welcomeCache = new NodeCache({ stdTTL: 86400, checkperiod: 3600 })
+
+const DEFAULT_WELCOME_MESSAGE =
+    '👋 Selamat datang di Grup TKA/Bimbel!\n\n' +
+    '🤖 Bot Jurnal MTSN siap membantu.\n\n' +
+    '📌 Cara input jurnal TKA (foto + caption):\n' +
+    '  8A tka matematika dasar\n' +
+    '  daring 8A tka literasi\n\n' +
+    '📌 Atau reply foto:\n' +
+    '  #jurnal-tka 8A matematika dasar\n' +
+    '  #jurnal-tka-daring 8A matematika\n\n' +
+    '📌 Daftar guru:\n' +
+    '  #daftar Nama @628xxx → balas ya\n\n' +
+    'Ketik /menu untuk bantuan lengkap.'
+
+// Track sender-unresolved retries per message to avoid infinite loops.
 
 // Track sender-unresolved retries per message to avoid infinite loops.
 // Maps `sessionId:remoteJid:id` -> attempt count.
@@ -229,6 +251,22 @@ const handleMessageUpsert = async (m, sessionId, wa, store) => {
             // This ensures command handling takes priority over raw image processing
             // handleGroupCommands will call handleGroupImageMessage internally when needed
             if (msg.key.remoteJid.endsWith('@g.us')) {
+                // Check for pending #daftar confirmations (ya/tidak/angka) BEFORE command handling.
+                // A bare "ya" is not a known command, so it must be intercepted here.
+                // Normalisasi senderJid sebelum key cache seperti handleDaftarCommand
+                const senderJid = msg.key.participant 
+                    ? await normalizeLidNumber(currentWa, msg.key.participant) 
+                    : (msg.key.remoteJid.endsWith('@g.us') ? '' : msg.key.remoteJid)
+                const daftarHandled = await checkDaftarConfirmation(currentWa, msg, sessionId, senderJid)
+                if (daftarHandled) {
+                    debug('WhatsApp', 'Message processed as #daftar confirmation', {
+                        sessionId,
+                        messageId: msg.key.id,
+                    })
+                    messageTmp.push(msg)
+                    continue
+                }
+
                 // Try command handler first for ALL group messages (text, image, extendedText)
                 const handled = await handleGroupCommands(currentWa, msg, sessionId)
 
@@ -514,6 +552,45 @@ const registerSessionHandlers = (sessionId, wa) => {
     }
 
     setupEventListeners(wa, sessionId, (instance, type, data) => callWebhook(instance, type, data))
+
+    // Fitur 4: Welcome message saat bot ditambahkan ke grup baru.
+    // HANYA kirim jika bot sendiri yang di-add (bukan member lain),
+    // dengan anti-spam 24 jam via welcomeCache.
+    wa.ev.removeAllListeners('group-participants.update')
+    wa.ev.on('group-participants.update', async ({ id, participants, action }) => {
+        if (process.env.WELCOME_ENABLED === 'false') return
+        if (action !== 'add') return
+
+        const botId = wa.user?.id
+        if (!botId || !participants?.length) return
+
+        const botNum = extractPhoneNumber(botId)
+        const added = participants.some((p) => extractPhoneNumber(p) === botNum || p === botId)
+        if (!added) return
+
+        if (welcomeCache.get(id)) return
+
+        const text = process.env.WELCOME_MESSAGE || DEFAULT_WELCOME_MESSAGE
+        const logoUrl = process.env.WELCOME_LOGO_URL
+
+        try {
+            if (logoUrl) {
+                const res = await axios.get(logoUrl, { responseType: 'arraybuffer', timeout: 10000 })
+                const mime = res.headers['content-type'] || 'image/jpeg'
+                const b64 = Buffer.from(res.data).toString('base64')
+                await wa.sendMessage(id, {
+                    image: { url: `data:${mime};base64,${b64}` },
+                    caption: text,
+                })
+            } else {
+                await wa.sendMessage(id, { text })
+            }
+            success('WhatsApp', 'Welcome message sent', { groupId: id })
+            welcomeCache.set(id, true)
+        } catch (e) {
+            await wa.sendMessage(id, { text }).catch(() => {})
+        }
+    })
 
     debug('WhatsApp', 'All session handlers registered', {
         sessionId,

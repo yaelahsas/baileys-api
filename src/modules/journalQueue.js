@@ -124,6 +124,15 @@ class JournalQueue {
                 ON journal_queue(session_id, group_jid, message_id)
         `)
 
+        // Add kategori column for TKA/Bimbel separation (default 'bimbel')
+        try {
+            this.db.exec("ALTER TABLE journal_queue ADD COLUMN kategori TEXT DEFAULT 'bimbel'")
+            info('JournalQueue', 'Added kategori column', { default: 'bimbel' })
+        } catch (e) {
+            if (!String(e.message).includes('duplicate column')) throw e
+            info('JournalQueue', 'kategori column already exists', {})
+        }
+
         info('JournalQueue', 'Database initialized', {
             dbPath: this.dbPath,
         })
@@ -191,18 +200,18 @@ class JournalQueue {
                 return { id: existing.id, status: existing.status, isNew: false }
             }
 
-            // If pending or failed, update with fresh data (in case image was re-sent)
-            this.db.prepare(`
-                UPDATE journal_queue SET
-                    no_lid = ?, kelas = ?, materi = ?, tanggal = ?,
-                    metode = ?, jenis = ?, foto = ?, keterangan = ?,
-                    updated_at = ?
-                WHERE id = ?
-            `).run(
-                data.no_lid, data.kelas, data.materi, data.tanggal,
-                data.metode, data.jenis, data.foto, data.keterangan,
-                now, existing.id
-            )
+// If pending or failed, update with fresh data (in case image was re-sent)
+                this.db.prepare(`
+                    UPDATE journal_queue SET
+                        no_lid = ?, kelas = ?, materi = ?, tanggal = ?,
+                        metode = ?, jenis = ?, kategori = ?, foto = ?, keterangan = ?,
+                        updated_at = ?
+                    WHERE id = ?
+                `).run(
+                    data.no_lid, data.kelas, data.materi, data.tanggal,
+                    data.metode, data.jenis, data.kategori || 'bimbel', data.foto, data.keterangan,
+                    now, existing.id
+                )
 
             queueLog('JournalQueue', 'Existing entry updated with fresh data', {
                 messageId: data.messageId,
@@ -219,15 +228,15 @@ class JournalQueue {
         const result = this.db.prepare(`
             INSERT INTO journal_queue (
                 message_id, session_id, group_jid, status,
-                no_lid, kelas, materi, tanggal, metode, jenis, foto, keterangan,
+                no_lid, kelas, materi, tanggal, metode, jenis, kategori, foto, keterangan,
                 attempts, max_attempts, created_at, updated_at
             ) VALUES (
-                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
             )
         `).run(
             data.messageId, data.sessionId, data.groupJid, JournalStatus.PENDING,
             data.no_lid, data.kelas, data.materi, data.tanggal,
-            data.metode, data.jenis, data.foto, data.keterangan,
+            data.metode, data.jenis, data.kategori || 'bimbel', data.foto, data.keterangan,
             0, 3, now, now
         )
 
@@ -419,7 +428,9 @@ class JournalQueue {
                 jenis: entry.jenis,
             }
 
-            const response = await axios.post(`${API_CONFIG.base_url}/create_jurnal`, data, {
+            const endpoint = entry.kategori === 'tka' ? '/create_jurnal_tka' : '/create_jurnal'
+
+            const response = await axios.post(`${API_CONFIG.base_url}${endpoint}`, data, {
                 headers: {
                     'Content-Type': 'application/json',
                     'X-API-Key': API_CONFIG.api_key,
@@ -697,11 +708,24 @@ class JournalQueue {
             sent: 0,
             failed: 0,
             total: 0,
+            byKategori: { bimbel: 0, tka: 0 },
         }
 
         for (const row of stats) {
             result[row.status] = row.count
             result.total += row.count
+        }
+
+        // Count by kategori
+        const byKategori = this.db.prepare(`
+            SELECT kategori, COUNT(*) as count FROM journal_queue GROUP BY kategori
+        `).all()
+
+        for (const row of byKategori) {
+            const key = row.kategori || 'bimbel'
+            if (key in result.byKategori) {
+                result.byKategori[key] = row.count
+            }
         }
 
         return result
