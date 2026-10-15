@@ -5,11 +5,25 @@ import sessionValidator from './../middlewares/sessionValidator.js'
 import * as controller from './../controllers/chatsController.js'
 import getMessages from './../controllers/getMessages.js'
 
+const isTimestampParam = (value) => {
+    if (value === '' || (!Number.isNaN(Number(value)) && Number.isFinite(Number(value)))) return true
+    if (!Number.isNaN(Date.parse(value))) return true
+    throw new Error('must be a unix timestamp or ISO date')
+}
+
 const router = Router()
 
 router.get('/', query('id').notEmpty(), requestValidator, sessionValidator, controller.getList)
 
-router.get('/:jid', query('id').notEmpty(), requestValidator, sessionValidator, getMessages)
+router.get(
+    '/:jid',
+    query('id').notEmpty(),
+    query('from').optional().custom(isTimestampParam),
+    query('to').optional().custom(isTimestampParam),
+    requestValidator,
+    sessionValidator,
+    getMessages,
+)
 
 router.post(
     '/delete',
@@ -18,7 +32,7 @@ router.post(
     body('message').notEmpty(),
     requestValidator,
     sessionValidator,
-    controller.deleteChat
+    controller.deleteChat,
 )
 
 router.post(
@@ -28,7 +42,7 @@ router.post(
     body('message').notEmpty(),
     requestValidator,
     sessionValidator,
-    controller.send
+    controller.send,
 )
 
 router.post('/send-bulk', query('id').notEmpty(), requestValidator, sessionValidator, controller.sendBulk)
@@ -41,7 +55,7 @@ router.post(
     body('isGroup').notEmpty(),
     requestValidator,
     sessionValidator,
-    controller.forward
+    controller.forward,
 )
 
 router.post(
@@ -50,7 +64,7 @@ router.post(
     body('keys').notEmpty(),
     requestValidator,
     sessionValidator,
-    controller.read
+    controller.read,
 )
 
 router.post(
@@ -60,7 +74,7 @@ router.post(
     body('presence').notEmpty(),
     requestValidator,
     sessionValidator,
-    controller.sendPresence
+    controller.sendPresence,
 )
 
 router.post(
@@ -70,7 +84,7 @@ router.post(
     body('messageId').notEmpty(),
     requestValidator,
     sessionValidator,
-    controller.downloadMedia
+    controller.downloadMedia,
 )
 
 router.get(
@@ -78,15 +92,9 @@ router.get(
     query('id').notEmpty(),
     requestValidator,
     sessionValidator,
-    controller.getMessageQueueStatus
+    controller.getMessageQueueStatus,
 )
 
-router.get(
-    '/queue/stats',
-    query('id').notEmpty(),
-    requestValidator,
-    sessionValidator,
-    controller.getQueueStatistics
-)
+router.get('/queue/stats', query('id').notEmpty(), requestValidator, sessionValidator, controller.getQueueStatistics)
 
 export default router

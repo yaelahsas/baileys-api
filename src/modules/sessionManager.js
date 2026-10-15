@@ -1,6 +1,6 @@
 /**
  * Session Manager Module
- * 
+ *
  * This module handles all session-related operations including:
  * - Creating new WhatsApp sessions
  * - Managing session lifecycle
@@ -20,18 +20,12 @@ import makeWASocketModule, {
     fetchLatestBaileysVersion,
 } from 'baileys'
 import makeInMemoryStore from '../../store/memory-store.js'
+import makeSQLiteStore from '../../store/sqlite-store.js'
 import { toDataURL } from 'qrcode'
 import __dirname from '../../dirname.js'
 import response from '../../response.js'
 import NodeCache from 'node-cache'
-import {
-    info,
-    success,
-    error,
-    warning,
-    debug,
-    event,
-} from '../utils/logger.js'
+import { info, success, error, warning, debug, event } from '../utils/logger.js'
 
 /**
  * Session storage maps
@@ -90,7 +84,7 @@ const msgRetryCounterCache = new NodeCache()
 
 /**
  * Get the sessions directory path
- * 
+ *
  * @param {string} sessionId - Optional session ID to append to path
  * @returns {string} Full path to sessions directory
  */
@@ -100,7 +94,7 @@ const sessionsDir = (sessionId = '') => {
 
 /**
  * Check if a session exists in memory
- * 
+ *
  * @param {string} sessionId - The session ID to check
  * @returns {boolean} True if session exists, false otherwise
  */
@@ -110,7 +104,7 @@ const isSessionExists = (sessionId) => {
 
 /**
  * Check if a session is connected
- * 
+ *
  * @param {string} sessionId - The session ID to check
  * @returns {boolean} True if session is connected, false otherwise
  */
@@ -120,7 +114,7 @@ const isSessionConnected = (sessionId) => {
 
 /**
  * Determine if a session should reconnect based on retry configuration
- * 
+ *
  * @param {string} sessionId - The session ID to check
  * @returns {boolean} True if should reconnect, false otherwise
  */
@@ -152,7 +146,7 @@ const shouldReconnect = (sessionId) => {
 
 /**
  * Get a session by ID
- * 
+ *
  * @param {string} sessionId - The session ID to retrieve
  * @returns {import('baileys').AnyWASocket|null} The session socket or null if not found
  */
@@ -162,7 +156,7 @@ const getSession = (sessionId) => {
 
 /**
  * Get list of all active session IDs
- * 
+ *
  * @returns {string[]} Array of session IDs
  */
 const getListSessions = () => {
@@ -171,7 +165,7 @@ const getListSessions = () => {
 
 /**
  * Stop keep-alive and connection monitoring timers for a session
- * 
+ *
  * @param {string} sessionId - The session ID to stop timers for
  */
 const stopKeepAlive = (sessionId) => {
@@ -197,7 +191,7 @@ const stopKeepAlive = (sessionId) => {
 /**
  * Force reconnect a session that has become stale (zombie connection)
  * This is called when keep-alive pings fail consecutively or connection is stale
- * 
+ *
  * @param {string} sessionId - The session ID
  * @param {string} reason - The reason for forcing reconnect
  */
@@ -251,7 +245,7 @@ const forceReconnect = (sessionId, reason) => {
             existingCallbacks?.onMessageUpsert || null,
             existingCallbacks?.onConnectionUpdate || null,
             existingCallbacks?.onWebhook || null,
-            true // isReconnect
+            true, // isReconnect
         )
     }, reconnectDelay)
 }
@@ -260,7 +254,7 @@ const forceReconnect = (sessionId, reason) => {
  * Start keep-alive mechanism for a session
  * Sends periodic ping/keep-alive requests to prevent the connection from being closed due to inactivity.
  * Tracks consecutive ping failures and forces reconnection when threshold is reached.
- * 
+ *
  * @param {string} sessionId - The session ID
  * @param {import('baileys').AnyWASocket} wa - The WhatsApp socket instance
  */
@@ -312,7 +306,8 @@ const startKeepAlive = (sessionId, wa) => {
             })
 
             // Send presence update as keep-alive ping with response verification
-            currentSession.sendPresenceUpdate('available')
+            currentSession
+                .sendPresenceUpdate('available')
                 .then(() => {
                     // Successful ping - reset counter
                     failedPingCounters.set(sessionId, 0)
@@ -350,10 +345,14 @@ const startKeepAlive = (sessionId, wa) => {
             failedPingCounters.set(sessionId, failedPings)
 
             if (failedPings >= MAX_FAILED_PINGS) {
-                error('SessionManager', `Max failed pings (${MAX_FAILED_PINGS}) reached after error, forcing reconnect`, {
-                    sessionId,
-                    failedPings,
-                })
+                error(
+                    'SessionManager',
+                    `Max failed pings (${MAX_FAILED_PINGS}) reached after error, forcing reconnect`,
+                    {
+                        sessionId,
+                        failedPings,
+                    },
+                )
                 clearInterval(keepAliveTimer)
                 keepAliveTimers.delete(sessionId)
                 forceReconnect(sessionId, `keep-alive-error-${failedPings}-pings`)
@@ -428,7 +427,7 @@ const startKeepAlive = (sessionId, wa) => {
 
 /**
  * Delete a session and clean up all associated files and timers
- * 
+ *
  * @param {string} sessionId - The session ID to delete
  */
 const deleteSession = (sessionId) => {
@@ -495,7 +494,7 @@ const createSession = async (
     onMessageUpsert = null,
     onConnectionUpdate = null,
     onWebhook = null,
-    isReconnect = false
+    isReconnect = false,
 ) => {
     info('SessionManager', isReconnect ? 'Reconnecting session' : 'Creating new session', {
         sessionId,
@@ -524,14 +523,21 @@ const createSession = async (
     const sessionFile = 'md_' + sessionId
 
     const logger = pino({ level: 'silent' })
-    const store = makeInMemoryStore({
-        preserveDataDuringSync: true,
-        backupBeforeSync: false,
-        incrementalSave: true,
-        maxMessagesPerChat: 150,
-        autoSaveInterval: 10000,
-        storeFile: sessionsDir(`${sessionId}_store.json`),
-    })
+    const storeFile = sessionsDir(`${sessionId}_store.json`)
+    const useSQLiteStore = (process.env.MESSAGE_STORE_TYPE || 'memory').toLowerCase() === 'sqlite'
+    const store = useSQLiteStore
+        ? makeSQLiteStore({
+              dbFile: sessionsDir(`${sessionId}_messages.db`),
+              retentionDays: parseInt(process.env.MESSAGE_RETENTION_DAYS || '90'),
+          })
+        : makeInMemoryStore({
+              preserveDataDuringSync: true,
+              backupBeforeSync: false,
+              incrementalSave: true,
+              maxMessagesPerChat: 150,
+              autoSaveInterval: 10000,
+              storeFile,
+          })
 
     const { state, saveCreds } = await useMultiFileAuthState(sessionsDir(sessionFile))
 
@@ -543,7 +549,7 @@ const createSession = async (
     })
 
     // Load store
-    store?.readFromFile(sessionsDir(`${sessionId}_store.json`))
+    await store?.readFromFile(storeFile)
     debug('SessionManager', 'Store loaded from file', {
         sessionId,
         storeFile: `${sessionId}_store.json`,
@@ -573,10 +579,10 @@ const createSession = async (
         markOnlineOnConnect: true,
         syncFullHistory: false,
 
-        getMessage: (key) => {
+        getMessage: async (key) => {
             if (store) {
-                const msg = store.loadMessages(key.remoteJid, key.id)
-                return msg?.message || undefined
+                const messages = await store.loadMessages(key.remoteJid, key.id)
+                return messages?.[0]?.message || undefined
             }
             return {}
         },
@@ -618,7 +624,7 @@ const createSession = async (
             sessionId,
             connection,
             statusCode,
-            reason: statusCode ? (DisconnectReason[statusCode] || 'Unknown') : undefined,
+            reason: statusCode ? DisconnectReason[statusCode] || 'Unknown' : undefined,
         })
 
         // Always use the latest stored callbacks (they may have been updated by whatsapp.js)
@@ -633,10 +639,10 @@ const createSession = async (
 
         if (connection === 'open') {
             retries.delete(sessionId)
-            
+
             // Start keep-alive mechanism when connection is open
             startKeepAlive(sessionId, wa)
-            
+
             success('SessionManager', 'Connection opened', {
                 sessionId,
             })
@@ -653,9 +659,10 @@ const createSession = async (
             })
 
             // Determine if this is a logged out scenario
-            const isLoggedOut = statusCode === DisconnectReason.loggedOut
-                || statusCode === DisconnectReason.badSession
-                || statusCode === DisconnectReason.forbidden
+            const isLoggedOut =
+                statusCode === DisconnectReason.loggedOut ||
+                statusCode === DisconnectReason.badSession ||
+                statusCode === DisconnectReason.forbidden
 
             if (isLoggedOut || !shouldReconnect(sessionId)) {
                 error('SessionManager', 'Session logged out or max retries reached', {
@@ -673,9 +680,10 @@ const createSession = async (
             // Calculate reconnection delay with exponential backoff
             const baseDelay = parseInt(process.env.RECONNECT_INTERVAL ?? 5000)
             const attemptCount = retries.get(sessionId) ?? 1
-            const reconnectDelay = statusCode === DisconnectReason.restartRequired
-                ? 1000 // Quick reconnect for restart required
-                : Math.min(baseDelay * Math.pow(1.5, attemptCount - 1), 60000) // Exponential backoff, max 60s
+            const reconnectDelay =
+                statusCode === DisconnectReason.restartRequired
+                    ? 1000 // Quick reconnect for restart required
+                    : Math.min(baseDelay * Math.pow(1.5, attemptCount - 1), 60000) // Exponential backoff, max 60s
 
             info('SessionManager', 'Scheduling reconnection', {
                 sessionId,
@@ -685,13 +693,10 @@ const createSession = async (
                 reason: DisconnectReason[statusCode] || 'Unknown',
             })
 
-            setTimeout(
-                () => {
-                    // Use null for callbacks - createSession will use stored callbacks from sessionCallbacks
-                    createSession(sessionId, null, options, null, null, null, true)
-                },
-                reconnectDelay,
-            )
+            setTimeout(() => {
+                // Use null for callbacks - createSession will use stored callbacks from sessionCallbacks
+                createSession(sessionId, null, options, null, null, null, true)
+            }, reconnectDelay)
         }
 
         if (qr) {
@@ -777,7 +782,7 @@ const cleanup = () => {
 
 /**
  * Initialize and restore all existing sessions from disk
- * 
+ *
  * @param {Function} onMessageUpsert - Callback for message upsert events
  * @param {Function} onConnectionUpdate - Callback for connection update events
  * @param {Function} onWebhook - Callback for webhook events

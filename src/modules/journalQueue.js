@@ -83,7 +83,7 @@ class JournalQueue {
         this.db.exec(`
             CREATE TABLE IF NOT EXISTS journal_queue (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                message_id TEXT UNIQUE,
+                message_id TEXT NOT NULL,
                 session_id TEXT NOT NULL,
                 group_jid TEXT NOT NULL,
                 status TEXT DEFAULT 'pending',
@@ -104,7 +104,7 @@ class JournalQueue {
             )
         `)
 
-        // Create index for faster pending queries
+        // Create indexes
         this.db.exec(`
             CREATE INDEX IF NOT EXISTS idx_journal_queue_status ON journal_queue(status)
         `)
@@ -113,6 +113,15 @@ class JournalQueue {
         `)
         this.db.exec(`
             CREATE INDEX IF NOT EXISTS idx_journal_queue_message_id ON journal_queue(message_id)
+        `)
+
+        // Add composite dedup index (session_id, group_jid, message_id).
+        // Safe to add alongside any legacy UNIQUE(message_id) index — WhatsApp message IDs
+        // are globally unique, so both constraints are compatible. We do NOT attempt to
+        // drop a legacy UNIQUE constraint's autoindex (SQLite forbids it).
+        this.db.exec(`
+            CREATE UNIQUE INDEX IF NOT EXISTS uq_journal_queue_dedup
+                ON journal_queue(session_id, group_jid, message_id)
         `)
 
         info('JournalQueue', 'Database initialized', {
@@ -155,10 +164,10 @@ class JournalQueue {
     enqueue(data) {
         const now = Date.now()
 
-        // Check if message already exists (deduplication)
+        // Check if message already exists (composite deduplication)
         const existing = this.db.prepare(
-            'SELECT id, status, attempts FROM journal_queue WHERE message_id = ?'
-        ).get(data.messageId)
+            'SELECT id, status, attempts FROM journal_queue WHERE session_id = ? AND group_jid = ? AND message_id = ?'
+        ).get(data.sessionId, data.groupJid, data.messageId)
 
         if (existing) {
             // Message already in queue
@@ -166,6 +175,8 @@ class JournalQueue {
                 queueLog('JournalQueue', 'Message already sent, skipping', {
                     messageId: data.messageId,
                     id: existing.id,
+                    sessionId: data.sessionId,
+                    groupJid: data.groupJid,
                 })
                 return { id: existing.id, status: existing.status, isNew: false }
             }
@@ -174,6 +185,8 @@ class JournalQueue {
                 queueLog('JournalQueue', 'Message is currently being processed, skipping', {
                     messageId: data.messageId,
                     id: existing.id,
+                    sessionId: data.sessionId,
+                    groupJid: data.groupJid,
                 })
                 return { id: existing.id, status: existing.status, isNew: false }
             }
@@ -195,6 +208,8 @@ class JournalQueue {
                 messageId: data.messageId,
                 id: existing.id,
                 previousStatus: existing.status,
+                sessionId: data.sessionId,
+                groupJid: data.groupJid,
             })
 
             return { id: existing.id, status: existing.status, isNew: false }
@@ -222,6 +237,8 @@ class JournalQueue {
             no_lid: data.no_lid,
             kelas: data.kelas,
             materi: data.materi,
+            sessionId: data.sessionId,
+            groupJid: data.groupJid,
         })
 
         return { id: result.lastInsertRowid, status: JournalStatus.PENDING, isNew: true }
@@ -271,14 +288,55 @@ class JournalQueue {
      * Used for deduplication in the message handler
      *
      * @param {string} messageId - WhatsApp message key ID
+     * @param {string} sessionId - Session ID
+     * @param {string} groupJid - Group JID
      * @returns {object|null} { id, status } or null if not found
      */
-    checkMessage(messageId) {
+    checkMessage(messageId, sessionId, groupJid) {
         const row = this.db.prepare(
-            'SELECT id, status FROM journal_queue WHERE message_id = ?'
-        ).get(messageId)
+            'SELECT id, status FROM journal_queue WHERE message_id = ? AND session_id = ? AND group_jid = ?'
+        ).get(messageId, sessionId, groupJid)
 
         return row || null
+    }
+
+    /**
+     * Atomically claim an entry for processing.
+     * Only succeeds when the entry still has the expected status, so concurrent
+     * workers (inline handler + periodic) cannot process the same entry twice.
+     *
+     * @param {number} id - Database row ID
+     * @param {string} expectedStatus - Status the row must currently have
+     * @returns {boolean} True if this caller acquired the entry (rows affected)
+     */
+    acquireEntry(id, expectedStatus) {
+        const result = this.db.prepare(
+            'UPDATE journal_queue SET status = ?, updated_at = ? WHERE id = ? AND status = ?'
+        ).run(JournalStatus.PROCESSING, Date.now(), id, expectedStatus)
+
+        return result.changes === 1
+    }
+
+    /**
+     * Get all processable entries (PENDING or retryable FAILED) for a session,
+     * oldest first to preserve FIFO delivery order.
+     *
+     * @param {string|null} sessionId - Optional session ID filter
+     * @returns {Array} Entries ordered by created_at ASC
+     */
+    getUnprocessed(sessionId = null) {
+        if (sessionId) {
+            return this.db.prepare(
+                `SELECT * FROM journal_queue
+                 WHERE session_id = ? AND status IN ('pending', 'failed') AND attempts < max_attempts
+                 ORDER BY created_at ASC, id ASC`
+            ).all(sessionId)
+        }
+        return this.db.prepare(
+            `SELECT * FROM journal_queue
+             WHERE status IN ('pending', 'failed') AND attempts < max_attempts
+             ORDER BY created_at ASC, id ASC`
+        ).all()
     }
 
     /**
@@ -323,13 +381,31 @@ class JournalQueue {
 
     /**
      * Process a single journal entry - send to API
+     * Uses atomic claim so inline and periodic processing never handle the
+     * same entry twice.
      *
      * @param {object} entry - Database entry
-     * @returns {Promise<boolean>} True if sent successfully
+     * @returns {Promise<{sent: boolean, skipped: boolean}>} Result
      */
     async processEntry(entry) {
-        // Mark as processing
-        this.updateStatus(entry.id, JournalStatus.PROCESSING)
+        // Only process pending or retryable failed entries
+        if (entry.status !== JournalStatus.PENDING && entry.status !== JournalStatus.FAILED) {
+            debug('JournalQueue', 'Entry not processable, skipping', {
+                id: entry.id,
+                status: entry.status,
+            })
+            return { sent: false, skipped: true }
+        }
+
+        // Atomically claim the entry; if another worker already owns it, skip
+        const claimed = this.acquireEntry(entry.id, entry.status)
+        if (!claimed) {
+            debug('JournalQueue', 'Entry already claimed by another worker, skipping', {
+                id: entry.id,
+                messageId: entry.message_id,
+            })
+            return { sent: false, skipped: true }
+        }
 
         try {
             const data = {
@@ -386,7 +462,7 @@ class JournalQueue {
                     }
                 }
 
-                return true
+                return { sent: true, skipped: false }
             } else {
                 // API returned but not success
                 const errorMsg = response.data?.message || 'API returned non-success status'
@@ -411,7 +487,7 @@ class JournalQueue {
                     error: errorMsg,
                 })
 
-                return false
+                return { sent: false, skipped: false }
             }
         } catch (err) {
             const newAttempts = entry.attempts + 1
@@ -437,7 +513,7 @@ class JournalQueue {
                 error: errorMsg,
             })
 
-            return false
+            return { sent: false, skipped: false }
         }
     }
 
@@ -457,12 +533,8 @@ class JournalQueue {
         this.isProcessing = true
 
         try {
-            // Get pending entries
-            const pendingEntries = this.getPendingBySession(sessionId)
-            // Get retryable failed entries
-            const failedEntries = this.getRetryable(sessionId)
-
-            const allEntries = [...pendingEntries, ...failedEntries]
+            // Get processable entries (pending + retryable failed) in FIFO order
+            const allEntries = this.getUnprocessed(sessionId)
 
             if (allEntries.length === 0) {
                 debug('JournalQueue', 'No pending entries to process', { sessionId })
@@ -471,17 +543,20 @@ class JournalQueue {
 
             info('JournalQueue', 'Processing pending journal entries', {
                 sessionId,
-                pendingCount: pendingEntries.length,
-                failedRetryCount: failedEntries.length,
                 total: allEntries.length,
             })
 
             let sentCount = 0
             let failedCount = 0
+            let processedCount = 0
 
             for (const entry of allEntries) {
                 const result = await this.processEntry(entry)
-                if (result) {
+                if (result.skipped) {
+                    continue
+                }
+                processedCount++
+                if (result.sent) {
                     sentCount++
                 } else {
                     failedCount++
@@ -493,12 +568,12 @@ class JournalQueue {
 
             success('JournalQueue', 'Batch processing completed', {
                 sessionId,
-                processed: allEntries.length,
+                processed: processedCount,
                 sent: sentCount,
                 failed: failedCount,
             })
 
-            return { processed: allEntries.length, sent: sentCount, failed: failedCount }
+            return { processed: processedCount, sent: sentCount, failed: failedCount }
         } finally {
             this.isProcessing = false
         }
@@ -518,10 +593,8 @@ class JournalQueue {
         this.isProcessing = true
 
         try {
-            const pendingEntries = this.getAllPending()
-            const failedEntries = this.getRetryable()
-
-            const allEntries = [...pendingEntries, ...failedEntries]
+            // Get processable entries (pending + retryable failed) in FIFO order
+            const allEntries = this.getUnprocessed()
 
             if (allEntries.length === 0) {
                 return { processed: 0, sent: 0, failed: 0 }
@@ -533,6 +606,7 @@ class JournalQueue {
 
             let sentCount = 0
             let failedCount = 0
+            let processedCount = 0
 
             for (const entry of allEntries) {
                 // Check if session exists and is connected before processing
@@ -547,7 +621,11 @@ class JournalQueue {
                 }
 
                 const result = await this.processEntry(entry)
-                if (result) {
+                if (result.skipped) {
+                    continue
+                }
+                processedCount++
+                if (result.sent) {
                     sentCount++
                 } else {
                     failedCount++
@@ -558,13 +636,13 @@ class JournalQueue {
 
             if (sentCount > 0 || failedCount > 0) {
                 success('JournalQueue', 'Periodic batch processing completed', {
-                    processed: allEntries.length,
+                    processed: processedCount,
                     sent: sentCount,
                     failed: failedCount,
                 })
             }
 
-            return { processed: allEntries.length, sent: sentCount, failed: failedCount }
+            return { processed: processedCount, sent: sentCount, failed: failedCount }
         } finally {
             this.isProcessing = false
         }
