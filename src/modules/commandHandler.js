@@ -455,6 +455,63 @@ const isAuthorized = (sender) => {
 }
 
 /**
+ * Extract the raw sender JID from any message type, preferring the quoted
+ * message's contextInfo.participant (the actual author of a replied message)
+ * and the message's own contextInfo.participant. Falls back through
+ * key.participant, key.participantAlt, and remoteJid for personal chats.
+ *
+ * @param {object} msg - The message object
+ * @returns {string} The raw sender JID, or '' when it cannot be determined
+ */
+const extractSenderJid = (msg) => {
+    const contextParticipant =
+        msg.message?.extendedTextMessage?.contextInfo?.participant ||
+        msg.message?.imageMessage?.contextInfo?.participant ||
+        msg.message?.videoMessage?.contextInfo?.participant ||
+        msg.message?.documentMessage?.contextInfo?.participant
+    if (contextParticipant) return contextParticipant
+
+    if (msg.message?.extendedTextMessage?.contextInfo?.quotedMessage) {
+        // A reply carries no participant for the replier here; the replier is key.participant.
+    }
+
+    if (msg.key?.participant) return msg.key.participant
+    if (msg.key?.participantAlt) return msg.key.participantAlt
+    if (thisMessageIsFromSelf(msg)) {
+        const selfLid = selfSenderLid(msg)
+        if (selfLid) return selfLid
+    }
+    if (isPersonalJid(msg.key?.remoteJid)) return msg.key.remoteJid
+    return ''
+}
+
+/**
+ * Resolve the sender's phone number for authorization, with a store-based
+ * fallback. Returns '' when the sender cannot be reliably determined, so the
+ * caller can retry instead of denying access with a wrong identity.
+ *
+ * @param {import('baileys').AnyWASocket} wa - The WhatsApp session
+ * @param {object} msg - The message object
+ * @returns {Promise<string>} The resolved phone number or '' if unresolved
+ */
+const resolveSenderPhone = async (wa, msg) => {
+    const raw = extractSenderJid(msg)
+    if (raw) {
+        const normalized = await normalizeLidNumber(wa, raw)
+        const digits = extractPhoneNumber(normalized)
+        // A raw @lid JID stays unresolved when the mapping is unknown: the
+        // extracted digits are a LID, not a phone number.
+        if (digits && !normalized.endsWith('@lid')) return digits
+        if (digits && AUTHORIZED_NUMBERS.includes(digits)) return digits
+    }
+
+    const stored = await resolveSenderFromStore(wa, msg)
+    if (stored) return stored
+
+    return ''
+}
+
+/**
  * Pending daftar cache — stores pending #daftar confirmations.
  * Key: `${groupJid}:${senderJid}`, Value: { guru_id, nama, no_lid_baru, no_lid_lama, expiresAt, sessionId, groupJid }
  * TTL 5 minutes.
@@ -779,39 +836,28 @@ const handleGroupCommands = async (wa, msg, sessionId) => {
         }
 
         // Authorization check - use participant (actual sender) not remoteJid (group ID)
-        // Use the same robust sender resolution as handleGroupImageMessage
-        let senderJid = msg.key.participant
-        if (!senderJid && msg.message?.extendedTextMessage?.contextInfo?.participant) {
-            senderJid = msg.message.extendedTextMessage.contextInfo.participant
-        }
-        if (!senderJid && msg.message?.imageMessage?.contextInfo?.participant) {
-            senderJid = msg.message.imageMessage.contextInfo.participant
-        }
-        if (!senderJid && msg.message?.videoMessage?.contextInfo?.participant) {
-            senderJid = msg.message.videoMessage.contextInfo.participant
-        }
-        if (!senderJid && msg.message?.documentMessage?.contextInfo?.participant) {
-            senderJid = msg.message.documentMessage.contextInfo.participant
-        }
-        if (!senderJid) senderJid = msg.key.participantAlt
-        if (!senderJid && thisMessageIsFromSelf(msg)) {
-            senderJid = selfSenderLid(msg)
-        }
-        if (!senderJid && isPersonalJid(msg.key.remoteJid)) {
-            senderJid = msg.key.remoteJid
-        }
-        if (!senderJid) {
-            // Store-based fallback
-            senderJid = (await resolveSenderFromStore(wa, msg)) || msg.key.remoteJid
-        }
-        // Normalize through LID→PN resolver for authorization check
-        const phoneNumber = await normalizeLidNumber(wa, senderJid)
+        // Resolve through the shared helper, which prefers contextInfo.participant
+        // and falls back to the session store for LID→PN mapping.
+        const phoneNumber = await resolveSenderPhone(wa, msg)
+        const senderJid = extractSenderJid(msg) || msg.key?.remoteJid || ''
 
         debug('CommandHandler', 'Authorization check', {
             sessionId,
             sender: senderJid,
             phoneNumber,
         })
+
+        if (!phoneNumber) {
+            // Sender could not be resolved yet (fresh upsert without
+            // key.participant). Do NOT deny access with a wrong identity —
+            // let whatsapp.js retry after Baileys populates the participant.
+            warning('CommandHandler', 'Sender unresolved, deferring for retry', {
+                sessionId,
+                sender: senderJid,
+            })
+
+            return SENDER_UNRESOLVED
+        }
 
         if (!isAuthorized(phoneNumber)) {
             warning('CommandHandler', 'Access denied for number', {
@@ -987,7 +1033,7 @@ const handleGroupCommands = async (wa, msg, sessionId) => {
                     msg.message?.extendedTextMessage?.contextInfo?.mentionedJid ||
                     msg.message?.imageMessage?.contextInfo?.mentionedJid
                 if (mentionedJid && mentionedJid.length > 0) {
-                    customLid = extractPhoneNumber(mentionedJid[0])
+                    customLid = await normalizeLidNumber(wa, mentionedJid[0])
                     info('CommandHandler', 'Custom LID from @mention', {
                         sessionId,
                         customLid,
@@ -1068,7 +1114,16 @@ Atau untuk guru lain (tag @guru):
                 })
 
                 try {
-                    await handleGroupImageMessage(wa, msg, sessionId, tanggalFinal, 'luring', 'akademik', customLid)
+                    const result = await handleGroupImageMessage(
+                        wa,
+                        msg,
+                        sessionId,
+                        tanggalFinal,
+                        'luring',
+                        'akademik',
+                        customLid,
+                    )
+                    if (result === SENDER_UNRESOLVED) return SENDER_UNRESOLVED
                     success('CommandHandler', '#jurnal command processed successfully', {
                         sessionId,
                     })
@@ -1094,7 +1149,7 @@ Atau untuk guru lain (tag @guru):
                 // Extract custom LID from @mention
                 const mentionedJidDaring = msg.message?.extendedTextMessage?.contextInfo?.mentionedJid
                 if (mentionedJidDaring && mentionedJidDaring.length > 0) {
-                    customLidDaring = extractPhoneNumber(mentionedJidDaring[0])
+                    customLidDaring = await normalizeLidNumber(wa, mentionedJidDaring[0])
                     info('CommandHandler', 'Custom LID from @mention (daring)', {
                         sessionId,
                         customLid: customLidDaring,
@@ -1175,7 +1230,7 @@ Atau untuk guru lain (tag @guru):
                 })
 
                 try {
-                    await handleGroupImageMessage(
+                    const result = await handleGroupImageMessage(
                         wa,
                         msg,
                         sessionId,
@@ -1184,6 +1239,7 @@ Atau untuk guru lain (tag @guru):
                         'akademik',
                         customLidDaring,
                     )
+                    if (result === SENDER_UNRESOLVED) return SENDER_UNRESOLVED
                     success('CommandHandler', '#jurnal-daring command processed successfully', {
                         sessionId,
                     })
@@ -1209,7 +1265,7 @@ Atau untuk guru lain (tag @guru):
                 // Extract custom LID from @mention
                 const mentionedJidEkstra = msg.message?.extendedTextMessage?.contextInfo?.mentionedJid
                 if (mentionedJidEkstra && mentionedJidEkstra.length > 0) {
-                    customLidEkstra = extractPhoneNumber(mentionedJidEkstra[0])
+                    customLidEkstra = await normalizeLidNumber(wa, mentionedJidEkstra[0])
                     info('CommandHandler', 'Custom LID from @mention (ekstra)', {
                         sessionId,
                         customLid: customLidEkstra,
@@ -1290,7 +1346,7 @@ Atau untuk guru lain (tag @guru):
                 })
 
                 try {
-                    await handleGroupImageMessage(
+                    const result = await handleGroupImageMessage(
                         wa,
                         msg,
                         sessionId,
@@ -1299,6 +1355,7 @@ Atau untuk guru lain (tag @guru):
                         'non_akademik',
                         customLidEkstra,
                     )
+                    if (result === SENDER_UNRESOLVED) return SENDER_UNRESOLVED
                     success('CommandHandler', '#ekstra command processed successfully', {
                         sessionId,
                     })
@@ -1348,7 +1405,7 @@ Atau untuk guru lain (tag @guru):
                     msg.message?.extendedTextMessage?.contextInfo?.mentionedJid ||
                     msg.message?.imageMessage?.contextInfo?.mentionedJid
                 if (mentionedJidTka && mentionedJidTka.length > 0) {
-                    customLidTka = extractPhoneNumber(mentionedJidTka[0])
+                    customLidTka = await normalizeLidNumber(wa, mentionedJidTka[0])
                     info('CommandHandler', 'Custom LID from @mention (TKA)', {
                         sessionId,
                         customLid: customLidTka,
@@ -1417,7 +1474,7 @@ ${cmd} @628xxx 06-02-2026 8A matematika dasar`,
                 }
 
                 try {
-                    await handleGroupImageMessage(
+                    const result = await handleGroupImageMessage(
                         wa,
                         msg,
                         sessionId,
@@ -1427,6 +1484,7 @@ ${cmd} @628xxx 06-02-2026 8A matematika dasar`,
                         customLidTka,
                         'tka',
                     )
+                    if (result === SENDER_UNRESOLVED) return SENDER_UNRESOLVED
                     success('CommandHandler', `${cmd} command processed successfully`, {
                         sessionId,
                     })

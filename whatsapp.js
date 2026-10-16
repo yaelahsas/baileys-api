@@ -111,17 +111,129 @@ const DEFAULT_WELCOME_MESSAGE =
     'Ketik /menu untuk bantuan lengkap.'
 
 // Track sender-unresolved retries per message to avoid infinite loops.
-
-// Track sender-unresolved retries per message to avoid infinite loops.
 // Maps `sessionId:remoteJid:id` -> attempt count.
 const senderRetryCount = new Map()
 const SENDER_RETRY_MAX = 3
 const SENDER_RETRY_DELAY = 3000 // ms
 
 /**
- * Retry processing a group image message whose sender could not be resolved on the
- * first upsert. Baileys often populates key.participant shortly after delivery, so a
- * short delayed retry lets the same message succeed instead of showing an error.
+ * Deduplicate incoming messages by WhatsApp message ID.
+ * Baileys delivers the same message multiple times (first as an
+ * `append`/partial upsert without key.participant, then as `notify`, plus
+ * occasional re-deliveries). Without this guard the same message is handled
+ * repeatedly, which caused duplicate replies and false "access denied"
+ * responses when the later upsert carried a different/unresolvable sender.
+ *
+ * Keyed as `sessionId:remoteJid:messageId`. Entries expire after 5 minutes.
+ */
+const processedMessages = new NodeCache({ stdTTL: 300, checkperiod: 60 })
+
+/**
+ * Return true when this exact message has already been seen, marking it as
+ * processed otherwise.
+ *
+ * @param {string} sessionId - The session ID
+ * @param {object} msg - The message object
+ * @returns {boolean} True if the message was already processed
+ */
+const messageDedupKey = (sessionId, msg) => {
+    const messageId = msg?.key?.id
+    if (!messageId) return ''
+    const jid = msg?.key?.remoteJid || ''
+    const fromMe = msg?.key?.fromMe ? '1' : '0'
+    return `${sessionId}:${jid}:${fromMe}:${messageId}`
+}
+
+const isDuplicateMessage = (sessionId, msg) => {
+    const key = messageDedupKey(sessionId, msg)
+    if (!key) return false
+    if (processedMessages.get(key)) return true
+    processedMessages.set(key, true)
+    return false
+}
+
+/**
+ * Process a single incoming message: route group messages to the command
+ * handler (falling back to image handling), otherwise run webhook media
+ * conversion. Returns a status string so callers can retry sender-unresolved
+ * messages without re-entering the deduplication guard.
+ *
+ * @param {object} msg - The message object
+ * @param {string} sessionId - The session ID
+ * @param {import('baileys').AnyWASocket} wa - The WhatsApp session
+ * @returns {Promise<{processed: boolean, senderUnresolved: boolean}>}
+ */
+const processSingleMessage = async (msg, sessionId, wa) => {
+    if (!msg?.message) {
+        debug('WhatsApp', 'Message has no content, skipping', {
+            sessionId,
+            messageId: msg?.key?.id,
+        })
+        return { processed: false, senderUnresolved: false }
+    }
+
+    const currentWa = sessionManager.getSession(sessionId) || wa
+    const typeMessage = Object.keys(msg.message)[0]
+
+    if (msg.key.remoteJid.endsWith('@g.us')) {
+        // Check for pending #daftar confirmations (ya/tidak/angka) BEFORE command handling.
+        // A bare "ya" is not a known command, so it must be intercepted here.
+        const senderJid = msg.key.participant
+            ? await normalizeLidNumber(currentWa, msg.key.participant)
+            : msg.key.remoteJid.endsWith('@g.us')
+              ? ''
+              : msg.key.remoteJid
+        const daftarHandled = await checkDaftarConfirmation(currentWa, msg, sessionId, senderJid)
+        if (daftarHandled) {
+            return { processed: true, senderUnresolved: false }
+        }
+
+        // Route ALL group messages through the command handler first so commands
+        // take priority over raw image processing.
+        const handled = await handleGroupCommands(currentWa, msg, sessionId)
+
+        // A command whose sender could not be resolved returns SENDER_UNRESOLVED.
+        if (handled === SENDER_UNRESOLVED) {
+            return { processed: false, senderUnresolved: true }
+        }
+
+        if (handled) {
+            return { processed: true, senderUnresolved: false }
+        }
+
+        // Not a command: handle image messages (with or without caption).
+        // Caption format like "8K ips" reaches handleGroupImageMessage's
+        // "Mode CAPTION LANGSUNG" branch for parsing kelas + materi.
+        if (typeMessage === 'imageMessage') {
+            const imageResult = await handleGroupImageMessage(currentWa, msg, sessionId)
+            if (imageResult === SENDER_UNRESOLVED) {
+                return { processed: false, senderUnresolved: true }
+            }
+            return { processed: true, senderUnresolved: false }
+        }
+
+        return { processed: false, senderUnresolved: false }
+    }
+
+    // Process media for webhook if enabled
+    if (
+        ['documentMessage', 'imageMessage', 'videoMessage', 'audioMessage'].includes(typeMessage) &&
+        process.env.APP_WEBHOOK_FILE_IN_BASE64 === 'true'
+    ) {
+        await processMediaForWebhook(currentWa, msg, typeMessage)
+        return { processed: true, senderUnresolved: false }
+    }
+
+    return { processed: false, senderUnresolved: false }
+}
+
+/**
+ * Retry processing a message whose sender could not be resolved on the first
+ * upsert. Baileys often populates key.participant shortly after delivery, so a
+ * short delayed retry lets the same message succeed instead of being dropped.
+ *
+ * The retry re-runs the full routing (command handler, then image handler) via
+ * processSingleMessage, which bypasses the deduplication guard.
  *
  * @param {string} sessionId - The session ID
  * @param {import('baileys').AnyWASocket} wa - The WhatsApp session
@@ -159,9 +271,9 @@ const retrySenderUnresolved = async (sessionId, wa, msg) => {
 
     // Always re-fetch the latest session in case of reconnection
     const currentWa = sessionManager.getSession(sessionId) || wa
-    const result = await handleGroupImageMessage(currentWa, msg, sessionId)
+    const result = await processSingleMessage(msg, sessionId, currentWa)
 
-    if (result !== SENDER_UNRESOLVED) {
+    if (!result.senderUnresolved) {
         // Processed (success or permanent error) - clean up the counter
         senderRetryCount.delete(key)
     } else {
@@ -230,6 +342,19 @@ const handleMessageUpsert = async (m, sessionId, wa, store) => {
                 from: msg.key.remoteJid,
             })
 
+            // Skip messages already handled in a previous upsert. Baileys redelivers
+            // the same message (append + notify), and without this guard the second
+            // pass re-runs command handling with a possibly different sender JID,
+            // producing duplicate replies and false access-denied messages.
+            if (isDuplicateMessage(sessionId, msg)) {
+                debug('WhatsApp', 'Duplicate message already processed, skipping', {
+                    sessionId,
+                    messageId: msg.key.id,
+                    from: msg.key.remoteJid,
+                })
+                continue
+            }
+
             if (!msg.message) {
                 debug('WhatsApp', 'Message has no content, skipping', {
                     sessionId,
@@ -247,79 +372,18 @@ const handleMessageUpsert = async (m, sessionId, wa, store) => {
             // Update message status
             updateMessageStatus(msg)
 
-            // For group messages, always route through handleGroupCommands first
-            // This ensures command handling takes priority over raw image processing
-            // handleGroupCommands will call handleGroupImageMessage internally when needed
-            if (msg.key.remoteJid.endsWith('@g.us')) {
-                // Check for pending #daftar confirmations (ya/tidak/angka) BEFORE command handling.
-                // A bare "ya" is not a known command, so it must be intercepted here.
-                // Normalisasi senderJid sebelum key cache seperti handleDaftarCommand
-                const senderJid = msg.key.participant 
-                    ? await normalizeLidNumber(currentWa, msg.key.participant) 
-                    : (msg.key.remoteJid.endsWith('@g.us') ? '' : msg.key.remoteJid)
-                const daftarHandled = await checkDaftarConfirmation(currentWa, msg, sessionId, senderJid)
-                if (daftarHandled) {
-                    debug('WhatsApp', 'Message processed as #daftar confirmation', {
-                        sessionId,
-                        messageId: msg.key.id,
-                    })
-                    messageTmp.push(msg)
-                    continue
-                }
+            const result = await processSingleMessage(msg, sessionId, currentWa)
 
-                // Try command handler first for ALL group messages (text, image, extendedText)
-                const handled = await handleGroupCommands(currentWa, msg, sessionId)
-
-                if (handled) {
-                    debug('WhatsApp', 'Message processed as group command', {
-                        sessionId,
-                        messageId: msg.key.id,
-                    })
-                    // Command was handled, skip further processing
-                    messageTmp.push(msg)
-                    continue
-                }
-
-                // If not a command, handle image messages (with or without caption)
-                // Caption langsung format like "8K ips" should reach handleGroupImageMessage's
-                // "Mode CAPTION LANGSUNG" branch for parsing kelas + materi
-                if (typeMessage === 'imageMessage') {
-                    debug(
-                        'WhatsApp',
-                        'Image message in group (no command match), processing via handleGroupImageMessage',
-                        {
-                            sessionId,
-                            groupId: msg.key.remoteJid,
-                            hasCaption: !!msg.message.imageMessage?.caption,
-                        },
-                    )
-                    const imageResult = await handleGroupImageMessage(currentWa, msg, sessionId)
-                    if (imageResult === SENDER_UNRESOLVED) {
-                        // Sender could not be resolved on first upsert — schedule a retry instead of failing
-                        await retrySenderUnresolved(sessionId, currentWa, msg)
-                    }
-                    messageTmp.push(msg)
-                    continue
-                }
-
-                debug('WhatsApp', 'Group message not a command, continuing', {
-                    sessionId,
-                    messageId: msg.key.id,
-                })
-            }
-
-            // Process media for webhook if enabled
-            if (
-                ['documentMessage', 'imageMessage', 'videoMessage', 'audioMessage'].includes(typeMessage) &&
-                process.env.APP_WEBHOOK_FILE_IN_BASE64 === 'true'
-            ) {
-                messageTmp.push(await processMediaForWebhook(currentWa, msg, typeMessage))
-                continue
+            if (result.senderUnresolved) {
+                // Sender could not be resolved on first upsert — schedule a retry
+                // instead of failing/replying with a false access error.
+                await retrySenderUnresolved(sessionId, currentWa, msg)
             }
 
             debug('WhatsApp', 'Message processing completed', {
                 sessionId,
                 messageId: msg.key.id,
+                processed: result.processed,
             })
             messageTmp.push(msg)
         } catch (err) {
