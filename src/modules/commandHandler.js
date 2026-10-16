@@ -41,6 +41,7 @@ const AUTHORIZED_NUMBERS = process.env.AUTHORIZED_NUMBERS
  */
 const KNOWN_COMMANDS = [
     '#laporan',
+    '#laporan-tka',
     '#jurnal',
     '#jurnal-daring',
     '#ekstra',
@@ -49,6 +50,7 @@ const KNOWN_COMMANDS = [
     '#daftar',
     '/menu',
     '/billing',
+    '/billing-tka',
     '/today',
     '/today-tka',
     '/rank',
@@ -919,6 +921,26 @@ const handleGroupCommands = async (wa, msg, sessionId) => {
                 return true
             }
 
+            case '#laporan-tka': {
+                command('CommandHandler', 'Processing #laporan-tka command (TKA)', {
+                    sessionId,
+                })
+
+                try {
+                    await handleReportTkaCommand(wa, msg)
+                    success('CommandHandler', '#laporan-tka command processed successfully', {
+                        sessionId,
+                    })
+                } catch (err) {
+                    error('CommandHandler', 'handleReportTkaCommand failed', {
+                        sessionId,
+                        error: err.message,
+                    })
+                }
+
+                return true
+            }
+
             case '/billing': {
                 command('CommandHandler', 'Processing /billing command', {
                     sessionId,
@@ -931,6 +953,26 @@ const handleGroupCommands = async (wa, msg, sessionId) => {
                     })
                 } catch (err) {
                     error('CommandHandler', 'handleBillingCommand failed', {
+                        sessionId,
+                        error: err.message,
+                    })
+                }
+
+                return true
+            }
+
+            case '/billing-tka': {
+                command('CommandHandler', 'Processing /billing-tka command (TKA)', {
+                    sessionId,
+                })
+
+                try {
+                    await handleBillingTkaCommand(wa, msg)
+                    success('CommandHandler', '/billing-tka command processed successfully', {
+                        sessionId,
+                    })
+                } catch (err) {
+                    error('CommandHandler', 'handleBillingTkaCommand failed', {
                         sessionId,
                         error: err.message,
                     })
@@ -2196,11 +2238,21 @@ const handleMenuCommand = async (wa, msg) => {
             `   Contoh: #laporan februari\n` +
             `   Format: #laporan guru @tag [bulan]\n` +
             `   Contoh: #laporan guru @628xxxx februari\n\n` +
+            `📊 *#laporan-tka* - Mengambil laporan jurnal TKA\n` +
+            `   Format: #laporan-tka [bulan]\n` +
+            `   Contoh: #laporan-tka februari\n` +
+            `   Format: #laporan-tka guru @tag [bulan]\n` +
+            `   Contoh: #laporan-tka guru @628xxxx februari\n\n` +
             `💰 */billing* - Mengambil laporan billing bulanan\n` +
             `   Format: /billing [bulan] [tahun]\n` +
             `   Contoh: /billing februari 2026\n` +
             `   Contoh: /billing 2 2026\n` +
             `   Contoh: /billing februari\n\n` +
+            `💰 */billing-tka* - Mengambil laporan billing bulanan TKA\n` +
+            `   Format: /billing-tka [bulan] [tahun]\n` +
+            `   Contoh: /billing-tka februari 2026\n` +
+            `   Contoh: /billing-tka 2 2026\n` +
+            `   Contoh: /billing-tka februari\n\n` +
             `📅 */today* - Melihat siapa yang sudah mengisi jurnal\n` +
             `   Format: /today\n` +
             `   Format: /today [tanggal]\n` +
@@ -2482,6 +2534,186 @@ const handleReportCommand = async (wa, msg) => {
 }
 
 /**
+ * Handle TKA report command - retrieves TKA journal PDF report
+ *
+ * Mirrors handleReportCommand but sources from the TKA dataset via the
+ * dedicated /get_laporan_tka_pdf endpoint.
+ *
+ * @param {import('baileys').AnyWASocket} wa - The WhatsApp session
+ * @param {object} msg - The message object
+ */
+const handleReportTkaCommand = async (wa, msg) => {
+    try {
+        const messageContent = msg.message.conversation || msg.message.extendedTextMessage?.text || ''
+
+        if (!messageContent.toLowerCase().startsWith('#laporan-tka')) {
+            return
+        }
+
+        const commandParts = messageContent.toLowerCase().split(' ')
+
+        const currentYear = new Date().getFullYear()
+        const currentMonth = new Date().getMonth() + 1
+
+        let reportType = 'bulanan'
+        let monthNum = currentMonth
+        let monthLabel = Object.keys(MONTH_MAP).find((k) => MONTH_MAP[k] === currentMonth)
+
+        if (commandParts.length === 2 && MONTH_MAP[commandParts[1]]) {
+            monthNum = MONTH_MAP[commandParts[1]]
+            monthLabel = commandParts[1]
+        } else if (commandParts.length >= 3 && commandParts[1] === 'bulan' && MONTH_MAP[commandParts[2]]) {
+            monthNum = MONTH_MAP[commandParts[2]]
+            monthLabel = commandParts[2]
+        } else if (commandParts.length >= 3 && commandParts[1] === 'bulanan' && MONTH_MAP[commandParts[2]]) {
+            monthNum = MONTH_MAP[commandParts[2]]
+            monthLabel = commandParts[2]
+        } else if (commandParts[1] === 'guru') {
+            reportType = 'guru'
+
+            const requestedMonth = commandParts.slice(2).find((part) => MONTH_MAP[part])
+
+            if (requestedMonth) {
+                monthNum = MONTH_MAP[requestedMonth]
+                monthLabel = requestedMonth
+            }
+        }
+
+        let url = `${API_CONFIG.base_url}/get_laporan_tka_pdf?tipe_laporan=${reportType}&tahun=${currentYear}&bulan=${monthNum}`
+        let filename = ''
+
+        if (reportType === 'bulanan') {
+            filename = `laporan_tka_bulanan_${monthLabel}_${currentYear}.pdf`
+        } else if (reportType === 'guru') {
+            let no_lid = ''
+
+            if (msg.message?.extendedTextMessage?.contextInfo?.mentionedJid?.length > 0) {
+                no_lid = extractPhoneNumber(msg.message.extendedTextMessage.contextInfo.mentionedJid[0])
+            } else if (commandParts[2]) {
+                no_lid = commandParts[2].replace(/[@a-z.]/gi, '')
+            }
+
+            if (!no_lid) {
+                await wa.sendMessage(
+                    msg.key.remoteJid,
+                    { text: '❌ Format salah.\nGunakan:\n#laporan-tka guru @tag\natau\n#laporan-tka guru 628xxxx' },
+                    { quoted: msg },
+                )
+                return
+            }
+
+            url += `&no_lid=${no_lid}`
+            filename = `laporan_tka_guru_${no_lid}_${monthLabel}_${currentYear}.pdf`
+        }
+
+        console.log('==============================================')
+        console.log('[LAPORAN-TKA] Memulai proses pengambilan laporan TKA')
+        console.log('[INFO] URL      :', url)
+        console.log('[INFO] Filename :', filename)
+        console.log('==============================================')
+
+        console.log('[STEP 1] Mengambil PDF dari API dengan retry logic...')
+
+        const response = await retryApiCall(
+            () =>
+                axios.get(url, {
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'X-API-Key': API_CONFIG.api_key,
+                    },
+                    responseType: 'arraybuffer',
+                    timeout: API_CONFIG.timeout,
+                }),
+            API_CONFIG.max_retries,
+            API_CONFIG.retry_delay,
+        )
+
+        console.log('[STEP 2] Response diterima dari API')
+        console.log('[INFO] Status Code:', response.status)
+
+        if (response.status === 200) {
+            console.log('[STEP 3] Convert PDF ke Base64...')
+
+            const pdfBase64 = Buffer.from(response.data, 'binary').toString('base64')
+
+            console.log('[INFO] Ukuran file base64:', pdfBase64.length)
+            console.log('[STEP 4] Mengirim file ke WhatsApp...')
+
+            await wa.sendMessage(
+                msg.key.remoteJid,
+                {
+                    document: { url: `data:application/pdf;base64,${pdfBase64}` },
+                    fileName: filename,
+                    mimetype: 'application/pdf',
+                    caption: `Berikut adalah laporan TKA ${reportType} yang diminta`,
+                },
+                { quoted: msg },
+            )
+
+            await wa.sendMessage(msg.key.remoteJid, {
+                react: {
+                    text: '✅',
+                    key: msg.key,
+                },
+            })
+
+            console.log('==============================================')
+            console.log('[SUCCESS] Laporan TKA berhasil terkirim!')
+            console.log('[INFO] File   :', filename)
+            console.log('[INFO] Tujuan :', msg.key.remoteJid)
+            console.log('==============================================')
+        } else {
+            console.log('==============================================')
+            console.log('[ERROR] API mengembalikan status bukan 200')
+            console.log('[ERROR] Status :', response.status)
+            console.log('==============================================')
+
+            await wa.sendMessage(
+                msg.key.remoteJid,
+                { text: '❌ Maaf, terjadi kesalahan saat mengambil laporan TKA.' },
+                { quoted: msg },
+            )
+
+            await wa.sendMessage(msg.key.remoteJid, {
+                react: {
+                    text: '❌',
+                    key: msg.key,
+                },
+            })
+        }
+    } catch (error) {
+        console.log('==============================================')
+        console.log('[ERROR] Gagal saat memproses laporan TKA')
+        console.log('==============================================')
+
+        if (error.response) {
+            console.log('[ERROR] Status  :', error.response.status)
+            console.log('[ERROR] Data    :', error.response.data)
+        } else if (error.request) {
+            console.log('[ERROR] Tidak ada response dari API')
+            console.log('[ERROR] Request :', error.request)
+        } else {
+            console.log('[ERROR] Message :', error.message)
+        }
+
+        console.log('[ERROR] Stack Trace:')
+        console.log(error.stack)
+
+        console.log('==============================================')
+
+        try {
+            await wa.sendMessage(
+                msg.key.remoteJid,
+                { text: '❌ Maaf, terjadi kesalahan saat memproses permintaan laporan TKA.' },
+                { quoted: msg },
+            )
+        } catch (sendErr) {
+            console.log('[ERROR] Gagal mengirim pesan error ke WhatsApp:', sendErr.message)
+        }
+    }
+}
+
+/**
  * Handle billing command - retrieves monthly billing PDF report
  *
  * @param {import('baileys').AnyWASocket} wa - The WhatsApp session
@@ -2656,6 +2888,182 @@ const handleBillingCommand = async (wa, msg) => {
             await wa.sendMessage(
                 msg.key.remoteJid,
                 { text: '❌ Maaf, terjadi kesalahan saat memproses permintaan billing.' },
+                { quoted: msg },
+            )
+        } catch (sendErr) {
+            console.log('[ERROR] Gagal mengirim pesan error ke WhatsApp:', sendErr.message)
+        }
+    }
+}
+
+/**
+ * Handle TKA billing command - retrieves monthly TKA billing PDF report
+ *
+ * Mirrors handleBillingCommand but sources from the TKA dataset via the
+ * dedicated /get_billing_tka_pdf endpoint.
+ *
+ * @param {import('baileys').AnyWASocket} wa - The WhatsApp session
+ * @param {object} msg - The message object
+ */
+const handleBillingTkaCommand = async (wa, msg) => {
+    try {
+        const messageContent = msg.message.conversation || msg.message.extendedTextMessage?.text || ''
+
+        if (!messageContent.toLowerCase().startsWith('/billing-tka')) {
+            return
+        }
+
+        const commandParts = messageContent.toLowerCase().split(' ')
+
+        const currentYear = new Date().getFullYear()
+        const currentMonth = new Date().getMonth() + 1
+
+        let monthNum = currentMonth
+        let yearNum = currentYear
+        let monthLabel = Object.keys(MONTH_MAP).find((k) => MONTH_MAP[k] === currentMonth)
+
+        if (commandParts.length >= 2) {
+            if (MONTH_MAP[commandParts[1]]) {
+                monthNum = MONTH_MAP[commandParts[1]]
+                monthLabel = commandParts[1]
+            } else {
+                const parsedMonth = parseInt(commandParts[1])
+                if (!isNaN(parsedMonth) && parsedMonth >= 1 && parsedMonth <= 12) {
+                    monthNum = parsedMonth
+                    monthLabel = Object.keys(MONTH_MAP).find((k) => MONTH_MAP[k] === parsedMonth)
+                } else {
+                    await wa.sendMessage(
+                        msg.key.remoteJid,
+                        {
+                            text: '❌ Format salah.\n\nGunakan:\n/billing-tka [bulan] [tahun]\n\nContoh:\n/billing-tka februari 2026\n/billing-tka 2 2026\n/billing-tka februari\n\nNama bulan: januari, februari, maret, dst.',
+                        },
+                        { quoted: msg },
+                    )
+                    return
+                }
+            }
+        }
+
+        if (commandParts.length >= 3) {
+            const parsedYear = parseInt(commandParts[2])
+            if (!isNaN(parsedYear) && parsedYear >= 2000 && parsedYear <= 2100) {
+                yearNum = parsedYear
+            } else {
+                await wa.sendMessage(
+                    msg.key.remoteJid,
+                    {
+                        text: '❌ Tahun tidak valid.\n\nGunakan tahun antara 2000-2100.\n\nContoh:\n/billing-tka februari 2026',
+                    },
+                    { quoted: msg },
+                )
+                return
+            }
+        }
+
+        const url = `${API_CONFIG.base_url}/get_billing_tka_pdf?bulan=${monthNum}&tahun=${yearNum}`
+        const filename = `billing_tka_bulanan_${monthLabel}_${yearNum}.pdf`
+
+        console.log('==============================================')
+        console.log('[BILLING-TKA] Memulai proses pengambilan billing TKA')
+        console.log('[INFO] URL      :', url)
+        console.log('[INFO] Filename :', filename)
+        console.log('[INFO] Bulan    :', monthNum, `(${monthLabel})`)
+        console.log('[INFO] Tahun    :', yearNum)
+        console.log('==============================================')
+
+        console.log('[STEP 1] Mengambil PDF dari API dengan retry logic...')
+
+        const response = await retryApiCall(
+            () =>
+                axios.get(url, {
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'X-API-Key': API_CONFIG.api_key,
+                    },
+                    responseType: 'arraybuffer',
+                    timeout: API_CONFIG.timeout,
+                }),
+            API_CONFIG.max_retries,
+            API_CONFIG.retry_delay,
+        )
+
+        console.log('[STEP 2] Response diterima dari API')
+        console.log('[INFO] Status Code:', response.status)
+
+        if (response.status === 200) {
+            console.log('[STEP 3] Convert PDF ke Base64...')
+
+            const pdfBase64 = Buffer.from(response.data, 'binary').toString('base64')
+
+            console.log('[INFO] Ukuran file base64:', pdfBase64.length)
+            console.log('[STEP 4] Mengirim file ke WhatsApp...')
+
+            await wa.sendMessage(
+                msg.key.remoteJid,
+                {
+                    document: { url: `data:application/pdf;base64,${pdfBase64}` },
+                    fileName: filename,
+                    mimetype: 'application/pdf',
+                    caption: `Berikut adalah laporan billing TKA bulanan ${monthLabel} ${yearNum}`,
+                },
+                { quoted: msg },
+            )
+
+            await wa.sendMessage(msg.key.remoteJid, {
+                react: {
+                    text: '✅',
+                    key: msg.key,
+                },
+            })
+
+            console.log('==============================================')
+            console.log('[SUCCESS] Billing TKA berhasil terkirim!')
+            console.log('[INFO] File   :', filename)
+            console.log('[INFO] Tujuan :', msg.key.remoteJid)
+            console.log('==============================================')
+        } else {
+            console.log('==============================================')
+            console.log('[ERROR] API mengembalikan status bukan 200')
+            console.log('[ERROR] Status :', response.status)
+            console.log('==============================================')
+
+            await wa.sendMessage(
+                msg.key.remoteJid,
+                { text: '❌ Maaf, terjadi kesalahan saat mengambil laporan billing TKA.' },
+                { quoted: msg },
+            )
+
+            await wa.sendMessage(msg.key.remoteJid, {
+                react: {
+                    text: '❌',
+                    key: msg.key,
+                },
+            })
+        }
+    } catch (error) {
+        console.log('==============================================')
+        console.log('[ERROR] Gagal saat memproses billing TKA')
+        console.log('==============================================')
+
+        if (error.response) {
+            console.log('[ERROR] Status  :', error.response.status)
+            console.log('[ERROR] Data    :', error.response.data)
+        } else if (error.request) {
+            console.log('[ERROR] Tidak ada response dari API')
+            console.log('[ERROR] Request :', error.request)
+        } else {
+            console.log('[ERROR] Message :', error.message)
+        }
+
+        console.log('[ERROR] Stack Trace:')
+        console.log(error.stack)
+
+        console.log('==============================================')
+
+        try {
+            await wa.sendMessage(
+                msg.key.remoteJid,
+                { text: '❌ Maaf, terjadi kesalahan saat memproses permintaan billing TKA.' },
                 { quoted: msg },
             )
         } catch (sendErr) {
@@ -3100,8 +3508,10 @@ export {
     handleGroupCommands,
     handleGroupImageMessage,
     handleReportCommand,
+    handleReportTkaCommand,
     handleMenuCommand,
     handleBillingCommand,
+    handleBillingTkaCommand,
     handleTodayCommand,
     handleRankCommand,
     handleDaftarCommand,
