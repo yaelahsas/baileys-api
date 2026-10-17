@@ -457,26 +457,23 @@ const isAuthorized = (sender) => {
 }
 
 /**
- * Extract the raw sender JID from any message type, preferring the quoted
- * message's contextInfo.participant (the actual author of a replied message)
- * and the message's own contextInfo.participant. Falls back through
- * key.participant, key.participantAlt, and remoteJid for personal chats.
+ * Extract the raw sender JID (the actual author of the CURRENT message) for
+ * authorization purposes.
+ *
+ * The sender is always `msg.key.participant` (group) or `remoteJid` (personal
+ * chat). DO NOT use `contextInfo.participant` here — that field holds the
+ * author of the QUOTED / forwarded message, not the sender of the current
+ * reply. Returning it caused authorization to be checked against the wrong
+ * user whenever an admin replied to another user's #jurnal / image message.
+ *
+ * LID attribution for journal entries is handled separately in
+ * handleGroupImageMessage, which intentionally uses contextInfo.participant
+ * to attribute the journal to the teacher who owns the quoted image.
  *
  * @param {object} msg - The message object
  * @returns {string} The raw sender JID, or '' when it cannot be determined
  */
 const extractSenderJid = (msg) => {
-    const contextParticipant =
-        msg.message?.extendedTextMessage?.contextInfo?.participant ||
-        msg.message?.imageMessage?.contextInfo?.participant ||
-        msg.message?.videoMessage?.contextInfo?.participant ||
-        msg.message?.documentMessage?.contextInfo?.participant
-    if (contextParticipant) return contextParticipant
-
-    if (msg.message?.extendedTextMessage?.contextInfo?.quotedMessage) {
-        // A reply carries no participant for the replier here; the replier is key.participant.
-    }
-
     if (msg.key?.participant) return msg.key.participant
     if (msg.key?.participantAlt) return msg.key.participantAlt
     if (thisMessageIsFromSelf(msg)) {
