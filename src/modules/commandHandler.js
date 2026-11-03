@@ -42,19 +42,25 @@ const AUTHORIZED_NUMBERS = process.env.AUTHORIZED_NUMBERS
 const KNOWN_COMMANDS = [
     '#laporan',
     '#laporan-tka',
+    '#laporan-to',
     '#jurnal',
     '#jurnal-daring',
     '#ekstra',
     '#jurnal-tka',
     '#jurnal-tka-daring',
+    '#jurnal-to',
+    '#jurnal-to-daring',
     '#daftar',
     '/menu',
     '/billing',
     '/billing-tka',
+    '/billing-to',
     '/today',
     '/today-tka',
+    '/today-to',
     '/rank',
     '/rank-tka',
+    '/rank-to',
 ]
 
 /**
@@ -938,9 +944,28 @@ const handleGroupCommands = async (wa, msg, sessionId) => {
                 return true
             }
 
-            case '/billing': {
-                command('CommandHandler', 'Processing /billing command', {
+            case '#laporan-to': {
+                command('CommandHandler', 'Processing #laporan-to command (Tryout)', {
                     sessionId,
+                })
+
+                try {
+                    await handleReportTryoutCommand(wa, msg)
+                    success('CommandHandler', '#laporan-to command processed successfully', {
+                        sessionId,
+                    })
+                } catch (err) {
+                    error('CommandHandler', 'handleReportTryoutCommand failed', {
+                        sessionId,
+                        error: err.message,
+                    })
+                }
+
+                return true
+            }
+
+            case '/billing': {
+                command('CommandHandler', 'Processing /billing command', {                    sessionId,
                 })
 
                 try {
@@ -970,6 +995,26 @@ const handleGroupCommands = async (wa, msg, sessionId) => {
                     })
                 } catch (err) {
                     error('CommandHandler', 'handleBillingTkaCommand failed', {
+                        sessionId,
+                        error: err.message,
+                    })
+                }
+
+                return true
+            }
+
+            case '/billing-to': {
+                command('CommandHandler', 'Processing /billing-to command (Tryout)', {
+                    sessionId,
+                })
+
+                try {
+                    await handleBillingTryoutCommand(wa, msg)
+                    success('CommandHandler', '/billing-to command processed successfully', {
+                        sessionId,
+                    })
+                } catch (err) {
+                    error('CommandHandler', 'handleBillingTryoutCommand failed', {
                         sessionId,
                         error: err.message,
                     })
@@ -1018,6 +1063,26 @@ const handleGroupCommands = async (wa, msg, sessionId) => {
                 return true
             }
 
+            case '/today-to': {
+                command('CommandHandler', 'Processing /today-to command (Tryout)', {
+                    sessionId,
+                })
+
+                try {
+                    await handleTodayCommand(wa, msg, 'tryout')
+                    success('CommandHandler', '/today-to command processed successfully', {
+                        sessionId,
+                    })
+                } catch (err) {
+                    error('CommandHandler', 'handleTodayCommand failed (Tryout)', {
+                        sessionId,
+                        error: err.message,
+                    })
+                }
+
+                return true
+            }
+
             case '/rank': {
                 command('CommandHandler', 'Processing /rank command', {
                     sessionId,
@@ -1050,6 +1115,26 @@ const handleGroupCommands = async (wa, msg, sessionId) => {
                     })
                 } catch (err) {
                     error('CommandHandler', 'handleRankCommand failed (TKA)', {
+                        sessionId,
+                        error: err.message,
+                    })
+                }
+
+                return true
+            }
+
+            case '/rank-to': {
+                command('CommandHandler', 'Processing /rank-to command (Tryout)', {
+                    sessionId,
+                })
+
+                try {
+                    await handleRankCommand(wa, msg, 'tryout')
+                    success('CommandHandler', '/rank-to command processed successfully', {
+                        sessionId,
+                    })
+                } catch (err) {
+                    error('CommandHandler', 'handleRankCommand failed (Tryout)', {
                         sessionId,
                         error: err.message,
                     })
@@ -1537,6 +1622,115 @@ ${cmd} @628xxx 06-02-2026 8A matematika dasar`,
                 return true
             }
 
+            case '#jurnal-to':
+            case '#jurnal-to-daring': {
+                const isDaringTo = cmd === '#jurnal-to-daring'
+                command('CommandHandler', `Processing ${cmd} command (Tryout)`, {
+                    sessionId,
+                })
+
+                const partsTo = text.split(' ')
+                let tanggalInputTo = null
+                let customLidTo = null
+
+                // Extract custom LID from @mention
+                const mentionedJidTo =
+                    msg.message?.extendedTextMessage?.contextInfo?.mentionedJid ||
+                    msg.message?.imageMessage?.contextInfo?.mentionedJid
+                if (mentionedJidTo && mentionedJidTo.length > 0) {
+                    customLidTo = await normalizeLidNumber(wa, mentionedJidTo[0])
+                    info('CommandHandler', 'Custom LID from @mention (Tryout)', {
+                        sessionId,
+                        customLid: customLidTo,
+                    })
+                }
+
+                // Parse arguments after command, skipping @mention parts
+                const argPartsTo = partsTo.slice(1).filter((p) => !p.startsWith('@'))
+
+                if (argPartsTo.length > 0) {
+                    tanggalInputTo = argPartsTo[0]
+                }
+
+                let tanggalFinalTo = null
+
+                if (tanggalInputTo) {
+                    const parsedDate = parseDate(tanggalInputTo)
+                    if (parsedDate) {
+                        tanggalFinalTo = parsedDate
+                        info('CommandHandler', 'Custom date detected for Tryout', {
+                            sessionId,
+                            customDate: tanggalFinalTo,
+                        })
+                    }
+                }
+
+                // Check if there's a quoted message
+                const quotedTo = msg.message?.extendedTextMessage?.contextInfo?.quotedMessage
+
+                if (!quotedTo) {
+                    warning('CommandHandler', `${cmd} without image reply`, {
+                        sessionId,
+                    })
+
+                    await wa.sendMessage(msg.key.remoteJid, {
+                        text: `Format salah.
+
+Gunakan:
+Reply gambar dengan:
+
+${cmd} 8A matematika dasar
+
+Atau dengan tanggal:
+
+${cmd} 06-02-2026 8A matematika dasar
+
+Atau untuk guru lain (tag @guru):
+
+${cmd} @628xxx 8A matematika dasar
+${cmd} @628xxx 06-02-2026 8A matematika dasar`,
+                    })
+
+                    return true
+                }
+
+                if (!quotedTo.imageMessage) {
+                    warning('CommandHandler', `Quoted message is not an image (${cmd})`, {
+                        sessionId,
+                    })
+
+                    await wa.sendMessage(msg.key.remoteJid, {
+                        text: 'Pesan yang direply bukan gambar. Mohon reply pesan gambar.',
+                    })
+
+                    return true
+                }
+
+                try {
+                    const result = await handleGroupImageMessage(
+                        wa,
+                        msg,
+                        sessionId,
+                        tanggalFinalTo,
+                        isDaringTo ? 'daring' : 'luring',
+                        'akademik',
+                        customLidTo,
+                        'tryout',
+                    )
+                    if (result === SENDER_UNRESOLVED) return SENDER_UNRESOLVED
+                    success('CommandHandler', `${cmd} command processed successfully`, {
+                        sessionId,
+                    })
+                } catch (err) {
+                    error('CommandHandler', `handleGroupImageMessage failed (${cmd})`, {
+                        sessionId,
+                        error: err.message,
+                    })
+                }
+
+                return true
+            }
+
             default:
                 debug('CommandHandler', 'Unknown command after switch', {
                     sessionId,
@@ -1784,6 +1978,9 @@ const handleGroupImageMessage = async (
         // Detect exact lowercase token 'tka' — this drives the TKA (auto-detected) mode
         const lowerParts = parts.map((part) => part.toLowerCase())
         const tkaIdx = lowerParts.indexOf('tka')
+        // Detect exact lowercase token 'to'/'tryout' — Tryout (auto-detected) mode.
+        // 'tryout' dicek lebih dulu agar caption "8A tryout matematika" tetap valid.
+        const toIdx = lowerParts.indexOf('tryout') !== -1 ? lowerParts.indexOf('tryout') : lowerParts.indexOf('to')
 
         // Mode COMMAND #JURNAL-TKA / #JURNAL-TKA-DARING
         if (parts[0].toLowerCase() === '#jurnal-tka' || parts[0].toLowerCase() === '#jurnal-tka-daring') {
@@ -1818,6 +2015,45 @@ Atau untuk guru lain (tag @guru):
 
 Varian daring:
 #jurnal-tka-daring 8A matematika dasar`,
+                    },
+                    { quoted: msg },
+                )
+                return
+            }
+        }
+        // Mode COMMAND #JURNAL-TO / #JURNAL-TO-DARING
+        else if (parts[0].toLowerCase() === '#jurnal-to' || parts[0].toLowerCase() === '#jurnal-to-daring') {
+            console.log('[INFO] Mode COMMAND', parts[0], 'terdeteksi')
+
+            if (parts.length >= 2) {
+                const parsedDate = parseDate(parts[1])
+                if (parsedDate) {
+                    tanggalKirim = parsedDate
+                    kelas = parts[2] || ''
+                    materi = parts.slice(3).join(' ')
+                    console.log('[INFO] Tanggal custom (Tryout):', tanggalKirim)
+                } else {
+                    kelas = parts[1] || ''
+                    materi = parts.slice(2).join(' ')
+                }
+            } else {
+                await wa.sendMessage(
+                    msg.key.remoteJid,
+                    {
+                        text: `❌ Format salah.
+
+Gunakan:
+#jurnal-to 8A matematika dasar
+
+Atau dengan tanggal:
+#jurnal-to 06-02-2026 8A matematika dasar
+
+Atau untuk guru lain (tag @guru):
+#jurnal-to @628xxx 8A matematika dasar
+#jurnal-to @628xxx 06-02-2026 8A matematika dasar
+
+Varian daring:
+#jurnal-to-daring 8A matematika dasar`,
                     },
                     { quoted: msg },
                 )
@@ -1964,6 +2200,37 @@ Tuliskan kelas terlebih dahulu, contoh: "8A tka matematika dasar"`,
             // Set kategori ke TKA
             kategori = 'tka'
         }
+        // Mode CAPTION TRYOUT (kelas to/tryout materi)
+        else if (toIdx !== -1) {
+            console.log('[INFO] Mode CAPTION TRYOUT terdeteksi')
+
+            // Validasi: token tidak boleh di awal (toIdx === 0 → format salah)
+            if (toIdx === 0) {
+                await wa.sendMessage(
+                    msg.key.remoteJid,
+                    {
+                        text: `❌ Format jurnal salah.
+Tuliskan kelas terlebih dahulu, contoh: "8A to matematika dasar"`,
+                    },
+                    { quoted: msg },
+                )
+                return
+            }
+
+            // Handle prefix 'daring': jika parts[0] === 'daring' dan toIdx > 0
+            if (parts[0].toLowerCase() === 'daring' && toIdx > 0) {
+                metode = 'daring'
+                kelas = parts[toIdx - 1]
+                materi = parts.slice(toIdx + 1).join(' ')
+            } else {
+                // Format standar: "kelas to materi"
+                kelas = parts[toIdx - 1]
+                materi = parts.slice(toIdx + 1).join(' ')
+            }
+
+            // Set kategori ke Tryout
+            kategori = 'tryout'
+        }
         // Mode CAPTION DARING (daring [kelas] [materi])
         else if (parts[0].toLowerCase() === 'daring') {
             console.log('[INFO] Mode CAPTION daring terdeteksi')
@@ -2108,8 +2375,13 @@ daring 7h matematika algoritma dasar
             },
         })
 
-        // Route to the correct SIM endpoint: TKA journals use /create_jurnal_tka
-        const jurnalEndpoint = kategori === 'tka' ? '/create_jurnal_tka' : '/create_jurnal'
+        // Route to the correct SIM endpoint per kategori
+        const jurnalEndpoint =
+            kategori === 'tka'
+                ? '/create_jurnal_tka'
+                : kategori === 'tryout'
+                  ? '/create_jurnal_tryout'
+                  : '/create_jurnal'
 
         // Step 3: If entry is pending (new or retry), try to send to API immediately
         // If it fails, the entry stays as 'pending' in DB and will be retried later
@@ -2280,7 +2552,29 @@ const handleMenuCommand = async (wa, msg) => {
             `   Luring/Akademik: 7h matematika algoritma dasar\n` +
             `   Daring/Akademik: daring 7h matematika algoritma dasar\n` +
             `   TKA (kategori terpisah): 8A tka matematika dasar\n` +
-            `   TKA daring: daring 8A tka matematika dasar\n\n` +
+            `   TKA daring: daring 8A tka matematika dasar\n` +
+            `   Tryout (kategori terpisah): 8A to matematika dasar\n` +
+            `   Tryout daring: daring 8A to matematika dasar\n\n` +
+            `📊 *#laporan-to* - Mengambil laporan jurnal Tryout\n` +
+            `   Format: #laporan-to [bulan]\n` +
+            `   Contoh: #laporan-to februari\n` +
+            `   Format: #laporan-to guru @tag [bulan]\n` +
+            `   Contoh: #laporan-to guru @628xxxx februari\n\n` +
+            `💰 */billing-to* - Billing bulanan Tryout\n` +
+            `   Format: /billing-to [bulan] [tahun]\n` +
+            `   Contoh: /billing-to februari 2026\n\n` +
+            `📅 */today-to* - Jurnal Tryout hari ini\n` +
+            `   Format: /today-to [tanggal]\n` +
+            `   Contoh: /today-to 07-10-2026\n\n` +
+            `🏅 */rank-to* - Ranking guru jurnal Tryout\n` +
+            `   Format: /rank-to [bulan] [tahun]\n` +
+            `   Contoh: /rank-to februari 2026\n\n` +
+            `🎯 *#jurnal-to / #jurnal-to-daring* - Input jurnal bimbingan Tryout\n` +
+            `   Format: #jurnal-to [tanggal] kelas materi (reply foto)\n` +
+            `   Contoh: #jurnal-to 8A matematika dasar\n` +
+            `   Contoh: #jurnal-to 06-02-2026 8A matematika dasar\n` +
+            `   Untuk guru lain: #jurnal-to @628xxx 8A matematika dasar\n` +
+            `   Varian daring: #jurnal-to-daring 8A matematika dasar\n\n` +
             `🎯 *#jurnal-tka / #jurnal-tka-daring* - Input jurnal TKA (kategori TKA, terpisah dari Bimbel)\n` +
             `   Format: #jurnal-tka [tanggal] kelas materi (reply foto)\n` +
             `   Contoh: #jurnal-tka 8A matematika dasar\n` +
@@ -3070,6 +3364,287 @@ const handleBillingTkaCommand = async (wa, msg) => {
 }
 
 /**
+ * Handle Tryout report command - retrieves Tryout journal PDF report
+ *
+ * Mirrors handleReportTkaCommand but sources from the Tryout dataset via the
+ * dedicated /get_laporan_tryout_pdf endpoint.
+ *
+ * @param {import('baileys').AnyWASocket} wa - The WhatsApp session
+ * @param {object} msg - The message object
+ */
+const handleReportTryoutCommand = async (wa, msg) => {
+    try {
+        const messageContent = msg.message.conversation || msg.message.extendedTextMessage?.text || ''
+
+        if (!messageContent.toLowerCase().startsWith('#laporan-to')) {
+            return
+        }
+
+        const commandParts = messageContent.toLowerCase().split(' ')
+
+        const currentYear = new Date().getFullYear()
+        const currentMonth = new Date().getMonth() + 1
+
+        let reportType = 'bulanan'
+        let monthNum = currentMonth
+        let monthLabel = Object.keys(MONTH_MAP).find((k) => MONTH_MAP[k] === currentMonth)
+
+        if (commandParts.length === 2 && MONTH_MAP[commandParts[1]]) {
+            monthNum = MONTH_MAP[commandParts[1]]
+            monthLabel = commandParts[1]
+        } else if (commandParts.length >= 3 && commandParts[1] === 'bulan' && MONTH_MAP[commandParts[2]]) {
+            monthNum = MONTH_MAP[commandParts[2]]
+            monthLabel = commandParts[2]
+        } else if (commandParts.length >= 3 && commandParts[1] === 'bulanan' && MONTH_MAP[commandParts[2]]) {
+            monthNum = MONTH_MAP[commandParts[2]]
+            monthLabel = commandParts[2]
+        } else if (commandParts[1] === 'guru') {
+            reportType = 'guru'
+
+            const requestedMonth = commandParts.slice(2).find((part) => MONTH_MAP[part])
+
+            if (requestedMonth) {
+                monthNum = MONTH_MAP[requestedMonth]
+                monthLabel = requestedMonth
+            }
+        }
+
+        let url = `${API_CONFIG.base_url}/get_laporan_tryout_pdf?tipe_laporan=${reportType}&tahun=${currentYear}&bulan=${monthNum}`
+        let filename = ''
+
+        if (reportType === 'bulanan') {
+            filename = `laporan_tryout_bulanan_${monthLabel}_${currentYear}.pdf`
+        } else if (reportType === 'guru') {
+            let no_lid = ''
+
+            if (msg.message?.extendedTextMessage?.contextInfo?.mentionedJid?.length > 0) {
+                no_lid = extractPhoneNumber(msg.message.extendedTextMessage.contextInfo.mentionedJid[0])
+            } else if (commandParts[2]) {
+                no_lid = commandParts[2].replace(/[@a-z.]/gi, '')
+            }
+
+            if (!no_lid) {
+                await wa.sendMessage(
+                    msg.key.remoteJid,
+                    { text: '❌ Format salah.\nGunakan:\n#laporan-to guru @tag\natau\n#laporan-to guru 628xxxx' },
+                    { quoted: msg },
+                )
+                return
+            }
+
+            url += `&no_lid=${no_lid}`
+            filename = `laporan_tryout_guru_${no_lid}_${monthLabel}_${currentYear}.pdf`
+        }
+
+        console.log('==============================================')
+        console.log('[LAPORAN-TO] Memulai proses pengambilan laporan Tryout')
+        console.log('[INFO] URL      :', url)
+        console.log('[INFO] Filename :', filename)
+        console.log('==============================================')
+
+        const response = await retryApiCall(
+            () =>
+                axios.get(url, {
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'X-API-Key': API_CONFIG.api_key,
+                    },
+                    responseType: 'arraybuffer',
+                    timeout: API_CONFIG.timeout,
+                }),
+            API_CONFIG.max_retries,
+            API_CONFIG.retry_delay,
+        )
+
+        if (response.status === 200) {
+            const pdfBase64 = Buffer.from(response.data, 'binary').toString('base64')
+
+            await wa.sendMessage(
+                msg.key.remoteJid,
+                {
+                    document: { url: `data:application/pdf;base64,${pdfBase64}` },
+                    fileName: filename,
+                    mimetype: 'application/pdf',
+                    caption: `Berikut adalah laporan Tryout ${reportType} yang diminta`,
+                },
+                { quoted: msg },
+            )
+
+            await wa.sendMessage(msg.key.remoteJid, {
+                react: {
+                    text: '✅',
+                    key: msg.key,
+                },
+            })
+
+            console.log('[SUCCESS] Laporan Tryout berhasil terkirim!', filename)
+        } else {
+            await wa.sendMessage(
+                msg.key.remoteJid,
+                { text: '❌ Maaf, terjadi kesalahan saat mengambil laporan Tryout.' },
+                { quoted: msg },
+            )
+
+            await wa.sendMessage(msg.key.remoteJid, {
+                react: {
+                    text: '❌',
+                    key: msg.key,
+                },
+            })
+        }
+    } catch (error) {
+        console.log('[ERROR] Gagal saat memproses laporan Tryout')
+        console.log(error.stack)
+
+        try {
+            await wa.sendMessage(
+                msg.key.remoteJid,
+                { text: '❌ Maaf, terjadi kesalahan saat memproses permintaan laporan Tryout.' },
+                { quoted: msg },
+            )
+        } catch (sendErr) {
+            console.log('[ERROR] Gagal mengirim pesan error ke WhatsApp:', sendErr.message)
+        }
+    }
+}
+
+/**
+ * Handle Tryout billing command - retrieves monthly Tryout billing PDF report
+ *
+ * Mirrors handleBillingTkaCommand but sources from the Tryout dataset via the
+ * dedicated /get_billing_tryout_pdf endpoint.
+ *
+ * @param {import('baileys').AnyWASocket} wa - The WhatsApp session
+ * @param {object} msg - The message object
+ */
+const handleBillingTryoutCommand = async (wa, msg) => {
+    try {
+        const messageContent = msg.message.conversation || msg.message.extendedTextMessage?.text || ''
+
+        if (!messageContent.toLowerCase().startsWith('/billing-to')) {
+            return
+        }
+
+        const commandParts = messageContent.toLowerCase().split(' ')
+
+        const currentYear = new Date().getFullYear()
+        const currentMonth = new Date().getMonth() + 1
+
+        let monthNum = currentMonth
+        let yearNum = currentYear
+        let monthLabel = Object.keys(MONTH_MAP).find((k) => MONTH_MAP[k] === currentMonth)
+
+        if (commandParts.length >= 2) {
+            if (MONTH_MAP[commandParts[1]]) {
+                monthNum = MONTH_MAP[commandParts[1]]
+                monthLabel = commandParts[1]
+            } else {
+                const parsedMonth = parseInt(commandParts[1])
+                if (!isNaN(parsedMonth) && parsedMonth >= 1 && parsedMonth <= 12) {
+                    monthNum = parsedMonth
+                    monthLabel = Object.keys(MONTH_MAP).find((k) => MONTH_MAP[k] === parsedMonth)
+                } else {
+                    await wa.sendMessage(
+                        msg.key.remoteJid,
+                        {
+                            text: '❌ Format salah.\n\nGunakan:\n/billing-to [bulan] [tahun]\n\nContoh:\n/billing-to februari 2026\n/billing-to 2 2026',
+                        },
+                        { quoted: msg },
+                    )
+                    return
+                }
+            }
+        }
+
+        if (commandParts.length >= 3) {
+            const parsedYear = parseInt(commandParts[2])
+            if (!isNaN(parsedYear) && parsedYear >= 2000 && parsedYear <= 2100) {
+                yearNum = parsedYear
+            } else {
+                await wa.sendMessage(
+                    msg.key.remoteJid,
+                    {
+                        text: '❌ Tahun tidak valid.\n\nGunakan tahun antara 2000-2100.\n\nContoh:\n/billing-to februari 2026',
+                    },
+                    { quoted: msg },
+                )
+                return
+            }
+        }
+
+        const url = `${API_CONFIG.base_url}/get_billing_tryout_pdf?bulan=${monthNum}&tahun=${yearNum}`
+        const filename = `billing_tryout_bulanan_${monthLabel}_${yearNum}.pdf`
+
+        console.log('[BILLING-TO] Memulai proses pengambilan billing Tryout')
+        console.log('[INFO] URL:', url)
+
+        const response = await retryApiCall(
+            () =>
+                axios.get(url, {
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'X-API-Key': API_CONFIG.api_key,
+                    },
+                    responseType: 'arraybuffer',
+                    timeout: API_CONFIG.timeout,
+                }),
+            API_CONFIG.max_retries,
+            API_CONFIG.retry_delay,
+        )
+
+        if (response.status === 200) {
+            const pdfBase64 = Buffer.from(response.data, 'binary').toString('base64')
+
+            await wa.sendMessage(
+                msg.key.remoteJid,
+                {
+                    document: { url: `data:application/pdf;base64,${pdfBase64}` },
+                    fileName: filename,
+                    mimetype: 'application/pdf',
+                    caption: `Berikut adalah laporan billing Tryout bulanan ${monthLabel} ${yearNum}`,
+                },
+                { quoted: msg },
+            )
+
+            await wa.sendMessage(msg.key.remoteJid, {
+                react: {
+                    text: '✅',
+                    key: msg.key,
+                },
+            })
+
+            console.log('[SUCCESS] Billing Tryout berhasil terkirim!', filename)
+        } else {
+            await wa.sendMessage(
+                msg.key.remoteJid,
+                { text: '❌ Maaf, terjadi kesalahan saat mengambil laporan billing Tryout.' },
+                { quoted: msg },
+            )
+
+            await wa.sendMessage(msg.key.remoteJid, {
+                react: {
+                    text: '❌',
+                    key: msg.key,
+                },
+            })
+        }
+    } catch (error) {
+        console.log('[ERROR] Gagal saat memproses billing Tryout')
+        console.log(error.stack)
+
+        try {
+            await wa.sendMessage(
+                msg.key.remoteJid,
+                { text: '❌ Maaf, terjadi kesalahan saat memproses permintaan billing Tryout.' },
+                { quoted: msg },
+            )
+        } catch (sendErr) {
+            console.log('[ERROR] Gagal mengirim pesan error ke WhatsApp:', sendErr.message)
+        }
+    }
+}
+
+/**
  * Handle rank command - retrieves ranking of teachers based on journal upload count
  *
  * @param {import('baileys').AnyWASocket} wa - The WhatsApp session
@@ -3082,6 +3657,10 @@ const handleRankCommand = async (wa, msg, kategori = 'bimbel') => {
 
         if (kategori === 'tka') {
             if (!messageContent.toLowerCase().startsWith('/rank-tka')) {
+                return
+            }
+        } else if (kategori === 'tryout') {
+            if (!messageContent.toLowerCase().startsWith('/rank-to')) {
                 return
             }
         } else if (!messageContent.toLowerCase().startsWith('/rank')) {
@@ -3146,7 +3725,13 @@ const handleRankCommand = async (wa, msg, kategori = 'bimbel') => {
         }
 
         // Build URL
-        const url = `${API_CONFIG.base_url}/${kategori === 'tka' ? '/get_rank_jurnal_tka' : '/get_rank_jurnal'}?bulan=${monthNum}&tahun=${yearNum}`
+        const rankEndpoint =
+            kategori === 'tka'
+                ? '/get_rank_jurnal_tka'
+                : kategori === 'tryout'
+                  ? '/get_rank_jurnal_tryout'
+                  : '/get_rank_jurnal'
+        const url = `${API_CONFIG.base_url}/${rankEndpoint}?bulan=${monthNum}&tahun=${yearNum}`
 
         console.log('==============================================')
         console.log('[RANK] Memulai proses pengambilan ranking jurnal')
@@ -3331,6 +3916,10 @@ const handleTodayCommand = async (wa, msg, kategori = 'bimbel') => {
             if (!messageContent.toLowerCase().startsWith('/today-tka')) {
                 return
             }
+        } else if (kategori === 'tryout') {
+            if (!messageContent.toLowerCase().startsWith('/today-to')) {
+                return
+            }
         } else if (!messageContent.toLowerCase().startsWith('/today')) {
             const firstWord = messageContent.toLowerCase().split(' ')[0]
             if (firstWord !== '/today') return
@@ -3366,7 +3955,13 @@ const handleTodayCommand = async (wa, msg, kategori = 'bimbel') => {
 
         console.log('[STEP 1] Mengambil data jurnal dari API dengan retry logic...')
 
-        const url = `${API_CONFIG.base_url}${kategori === 'tka' ? '/get_jurnal_today_tka' : '/get_jurnal_today'}`
+        const todayEndpoint =
+            kategori === 'tka'
+                ? '/get_jurnal_today_tka'
+                : kategori === 'tryout'
+                  ? '/get_jurnal_today_tryout'
+                  : '/get_jurnal_today'
+        const url = `${API_CONFIG.base_url}${todayEndpoint}`
 
         const response = await retryApiCall(
             () =>
@@ -3506,9 +4101,11 @@ export {
     handleGroupImageMessage,
     handleReportCommand,
     handleReportTkaCommand,
+    handleReportTryoutCommand,
     handleMenuCommand,
     handleBillingCommand,
     handleBillingTkaCommand,
+    handleBillingTryoutCommand,
     handleTodayCommand,
     handleRankCommand,
     handleDaftarCommand,

@@ -105,7 +105,8 @@ const DEFAULT_WELCOME_MESSAGE =
     '  daring 8A tka literasi\n\n' +
     '📌 Atau reply foto:\n' +
     '  #jurnal-tka 8A matematika dasar\n' +
-    '  #jurnal-tka-daring 8A matematika\n\n' +
+    '  #jurnal-tka-daring 8A matematika\n' +
+    '  #jurnal-to 8A matematika dasar (bimbingan tryout)\n\n' +
     '📌 Daftar guru:\n' +
     '  #daftar Nama @628xxx → balas ya\n\n' +
     'Ketik /menu untuk bantuan lengkap.'

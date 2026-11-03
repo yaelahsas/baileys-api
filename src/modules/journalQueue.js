@@ -428,7 +428,12 @@ class JournalQueue {
                 jenis: entry.jenis,
             }
 
-            const endpoint = entry.kategori === 'tka' ? '/create_jurnal_tka' : '/create_jurnal'
+            const endpoint =
+                entry.kategori === 'tka'
+                    ? '/create_jurnal_tka'
+                    : entry.kategori === 'tryout'
+                      ? '/create_jurnal_tryout'
+                      : '/create_jurnal'
 
             const response = await axios.post(`${API_CONFIG.base_url}${endpoint}`, data, {
                 headers: {
@@ -708,7 +713,7 @@ class JournalQueue {
             sent: 0,
             failed: 0,
             total: 0,
-            byKategori: { bimbel: 0, tka: 0 },
+            byKategori: { bimbel: 0, tka: 0, tryout: 0 },
         }
 
         for (const row of stats) {
