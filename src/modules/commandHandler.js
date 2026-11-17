@@ -16,6 +16,7 @@ import { info, success, error, warning, command, api, apiCall, report, debug, se
 import fs from 'fs'
 import { generateVoiceNote } from '../utils/tts.js'
 import { journalQueue, JournalStatus } from './journalQueue.js'
+import { HASHTAG_COMMANDS, parseHashtagCaption } from '../utils/hashtagCaption.js'
 
 /**
  * Sentinel returned by handleGroupImageMessage when the sender cannot be resolved
@@ -831,6 +832,39 @@ const handleGroupCommands = async (wa, msg, sessionId) => {
             text,
             command: cmd,
         })
+
+        // Guard command hashtag jurnal (#tka/#bimbel/#to/#tahfidz):
+        // - Foto + caption  -> return false agar mengalir ke parser caption
+        //   (handleGroupImageMessage, mode COMMAND HASHTAG).
+        // - Pesan teks biasa -> info format, tidak diproses lebih lanjut.
+        if (HASHTAG_COMMANDS.includes(cmd)) {
+            if (msg.message?.imageMessage?.caption) {
+                debug('CommandHandler', 'Hashtag caption command, defer to caption parser', {
+                    sessionId,
+                    command: cmd,
+                })
+                return false
+            }
+
+            warning('CommandHandler', 'Hashtag command without photo caption', {
+                sessionId,
+                command: cmd,
+            })
+
+            await wa.sendMessage(msg.key.remoteJid, {
+                text: `❌ Command ${cmd} harus dikirim pada FOTO dengan caption.
+
+Format:
+${cmd} kelas materi
+${cmd} daring kelas materi
+
+Contoh:
+#tka daring 8i soal soal
+#bimbel 8a matematika`,
+            })
+
+            return true
+        }
 
         if (!KNOWN_COMMANDS.includes(cmd)) {
             debug('CommandHandler', 'Unknown command, skipping', {
@@ -1982,8 +2016,19 @@ const handleGroupImageMessage = async (
         // 'tryout' dicek lebih dulu agar caption "8A tryout matematika" tetap valid.
         const toIdx = lowerParts.indexOf('tryout') !== -1 ? lowerParts.indexOf('tryout') : lowerParts.indexOf('to')
 
+        // Mode COMMAND HASHTAG di caption (#tka/#bimbel/#to/#tahfidz + varian daring).
+        // Dicek paling awal agar tidak tertelan deteksi token 'tka'/'to' caption lama.
+        const hashtagParsed = parseHashtagCaption(text)
+        if (hashtagParsed) {
+            console.log('[INFO] Mode COMMAND HASHTAG', parts[0], 'terdeteksi')
+            kelas = hashtagParsed.kelas
+            materi = hashtagParsed.materi
+            metode = hashtagParsed.metode
+            kategori = hashtagParsed.kategori
+            console.log('[INFO] Hashtag parse:', { kelas, materi, metode, kategori })
+        }
         // Mode COMMAND #JURNAL-TKA / #JURNAL-TKA-DARING
-        if (parts[0].toLowerCase() === '#jurnal-tka' || parts[0].toLowerCase() === '#jurnal-tka-daring') {
+        else if (parts[0].toLowerCase() === '#jurnal-tka' || parts[0].toLowerCase() === '#jurnal-tka-daring') {
             console.log('[INFO] Mode COMMAND', parts[0], 'terdeteksi')
 
             if (parts.length >= 2) {

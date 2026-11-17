@@ -94,12 +94,12 @@ router.post(
     controller.updateProfilePicture
 )
 
-router.post(
+router.get(
     '/get-participants',
     query('id').notEmpty(),
     requestValidator,
     sessionValidator,
-    controller.getListWithoutParticipants
+    controller.getListWithParticipants
 )
 
 // Catch-all route for group conversation messages - MUST be last!

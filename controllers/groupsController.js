@@ -24,11 +24,15 @@ const getList = (req, res) => {
     return response(res, 200, true, '', getChatList(session, true))
 }
 
-const getListWithoutParticipants = async (req, res) => {
+// Mengambil daftar semua grup yang diikuti bot BESERTA participants-nya.
+// Catatan: groupFetchAllParticipating() mengembalikan object keyed-by-jid,
+// jadi dinormalisasi ke array agar konsisten dengan endpoint lain.
+const getListWithParticipants = async (req, res) => {
     const session = getSession(res.locals.sessionId)
     try {
-        const groups = await getGroupsWithParticipants(session)
-        return response(res, 200, true, '', groups)
+        const groupsMap = await getGroupsWithParticipants(session)
+        const groups = Object.values(groupsMap)
+        return response(res, 200, true, '', { count: groups.length, groups })
     } catch {
         response(res, 500, false, 'Failed to get group list with participants.')
     }
@@ -259,6 +263,6 @@ export {
     groupInviteCode,
     groupAcceptInvite,
     groupRevokeInvite,
-    getListWithoutParticipants,
+    getListWithParticipants,
     updateProfilePicture,
 }
