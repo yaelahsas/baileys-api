@@ -18,6 +18,21 @@ const fileExists = (path) => {
     return Boolean(fs.existsSync(path))
 }
 
+/**
+ * Deteksi apakah string adalah data-URI base64 (mis. 'data:image/jpeg;base64,...').
+ *
+ * Media dapat dikirim tanpa URL jaringan: Baileys mendekode data-URI menjadi
+ * Buffer langsung (lihat getStream() di messages-media.js), sehingga gateway
+ * TIDAK perlu meng-fetch apa pun. Ini menghindari kegagalan fetch ke URL publik
+ * yang berada di belakang Cloudflare (penyebab 'Failed to fetch stream').
+ */
+const isDataUri = (str) => {
+    return Boolean(
+        typeof str === 'string' &&
+        /^data:[\w./+-]+;base64,[A-Za-z0-9+/=]+$/.test(str)
+    )
+}
+
 const deleteFile = async (path) => {
     return new Promise((resolve, reject) => {
         fs.unlink(path, (err) => {
@@ -26,4 +41,4 @@ const deleteFile = async (path) => {
     })
 }
 
-export { compareAndFilter, isUrlValid, fileExists, deleteFile }
+export { compareAndFilter, isUrlValid, fileExists, isDataUri, deleteFile }

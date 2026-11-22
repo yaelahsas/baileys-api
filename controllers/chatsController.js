@@ -13,7 +13,7 @@ import {
     getStoreMessage,
 } from './../whatsapp.js'
 import response from './../response.js'
-import { compareAndFilter, fileExists, isUrlValid } from './../utils/functions.js'
+import { compareAndFilter, fileExists, isUrlValid, isDataUri } from './../utils/functions.js'
 
 const getList = (req, res) => {
     const session = getSession(res.locals.sessionId)
@@ -43,10 +43,11 @@ const send = async (req, res) => {
                 return response(res, 400, false, 'The URL is invalid or empty.')
             }
 
-            if (!isUrlValid(url)) {
-                if (!fileExists(url)) {
-                    return response(res, 400, false, 'The file or url does not exist.')
-                }
+            // Media boleh berupa: URL http(s), path file lokal, ATAU data-URI base64.
+            // Data-URI diteruskan langsung ke Baileys (didekode jadi Buffer) tanpa fetch
+            // jaringan — menghindari 'Failed to fetch stream' pada URL di balik Cloudflare.
+            if (!isUrlValid(url) && !fileExists(url) && !isDataUri(url)) {
+                return response(res, 400, false, 'The file or url does not exist.')
             }
         }
 
